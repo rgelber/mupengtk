@@ -191,6 +191,42 @@ class SwitcherWindow(Gtk.Window):
             s_full.set_fullscreen(state)
         print("Switch was turned", state)
 
+class ComboBoxWindow(Gtk.Window):
+    def __init__(self):
+        Gtk.Window.__init__(self, title="Plugins")
+
+        self.set_border_width(10)
+
+        currencies = [
+            "Euro",
+            "US Dollars",
+            "British Pound",
+            "Japanese Yen",
+            "Russian Ruble",
+            "Mexican peso",
+            "Swiss franc",
+        ]
+        currency_combo = Gtk.ComboBoxText()
+        currency_combo.set_entry_text_column(0)
+        currency_combo.connect("changed", self.on_currency_combo_changed)
+        for currency in currencies:
+            currency_combo.append_text(currency)
+
+        currency_combo.set_active(0)
+        vbox.pack_start(currency_combo, False, False, 0)
+
+        self.add(vbox)
+
+    def on_currency_combo_changed(self, combo):
+        text = combo.get_active_text()
+        if text is not None:
+            print("Selected: currency=%s" % text)
+
+
+win = ComboBoxWindow()
+win.connect("destroy", Gtk.main_quit)
+win.show_all()
+Gtk.main()
 
 class Application(Gtk.Application):
     def __init__(self):
