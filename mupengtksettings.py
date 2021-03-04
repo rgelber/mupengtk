@@ -6,8 +6,15 @@ from shutil import copyfile
 
 class read_settings:
     def __init__(self):
+        default_dir = os.path.expanduser('~/.config/mupengtk')
+        default_path = default_dir + "/settings.yaml"
+        if not os.path.exists(default_dir):
+            os.makedirs(default_dir)
+            src = 'default_settings.yaml'
+            dst = default_path
+            copyfile(src, dst)
         try:
-            with open('/etc/mupengtk/settings.yaml') as settings:
+            with open(default_path) as settings:
                 settings = yaml.load(settings, Loader=yaml.FullLoader)
                 self.rom = settings["settings"]["rom"]
                 self.gfx = settings["settings"]["plugins"]["gfx"]
@@ -17,9 +24,7 @@ class read_settings:
                 self.resolution = settings["settings"]["resolution"]
                 self.fullscreen = settings["settings"]["fullscreen"]
         except FileNotFoundError:
-            src = 'default_settings.yaml'
-            dst = '/etc/mupengtk/settings.yaml'
-            copyfile(src, dst)
+            pass
 
     def get_rom(self):
         return self.rom
@@ -45,6 +50,8 @@ class read_settings:
 
 class set_settings:
     def __init__(self):
+        default_dir = os.path.expanduser('~/.config/mupengtk')
+        self.default_path = default_dir + "/settings.yaml"
         self.rom = 'data["settings"]["rom"]'
         self.gfx = 'data["settings"]["plugins"]["gfx"]'
         self.audio = 'data["settings"]["plugins"]["audio"]'
@@ -55,10 +62,10 @@ class set_settings:
 
     def set_rom(self, value):
         try:
-            with open('/etc/mupengtk/settings.yaml') as settings:
+            with open(self.default_path) as settings:
                 data = yaml.load(settings, Loader=yaml.FullLoader)
                 data["settings"]["rom"] = value
-            with open('/etc/mupengtk/settings.yaml', 'w') as settings:
+            with open(self.default_path, 'w') as settings:
                 yaml.dump(data, settings)
         except FileNotFoundError:
             print('error')
@@ -66,10 +73,10 @@ class set_settings:
 
     def set_gfx(self, value):
         try:
-            with open('/etc/mupengtk/settings.yaml') as settings:
+            with open(self.default_path) as settings:
                 data = yaml.load(settings, Loader=yaml.FullLoader)
                 data["settings"]["plugins"]["gfx"] = value
-            with open('/etc/mupengtk/settings.yaml', 'w') as settings:
+            with open(self.default_path, 'w') as settings:
                 yaml.dump(data, settings)
         except FileNotFoundError:
             print('error')
@@ -77,10 +84,10 @@ class set_settings:
 
     def set_audio(self, value):
         try:
-            with open('/etc/mupengtk/settings.yaml') as settings:
+            with open(self.default_path) as settings:
                 data = yaml.load(settings, Loader=yaml.FullLoader)
                 data["settings"]["plugins"]["audio"] = value
-            with open('/etc/mupengtk/settings.yaml', 'w') as settings:
+            with open(self.default_path, 'w') as settings:
                 yaml.dump(data, settings)
         except FileNotFoundError:
             print('error')
@@ -88,10 +95,10 @@ class set_settings:
 
     def set_input(self, value):
         try:
-            with open('/etc/mupengtk/settings.yaml') as settings:
+            with open(self.default_path) as settings:
                 data = yaml.load(settings, Loader=yaml.FullLoader)
                 data["settings"]["plugins"]["input"] = value
-            with open('/etc/mupengtk/settings.yaml', 'w') as settings:
+            with open(self.default_path, 'w') as settings:
                 yaml.dump(data, settings)
         except FileNotFoundError:
             print('error')
@@ -99,10 +106,10 @@ class set_settings:
 
     def set_rsp(self, value):
         try:
-            with open('/etc/mupengtk/settings.yaml') as settings:
+            with open(self.default_path) as settings:
                 data = yaml.load(settings, Loader=yaml.FullLoader)
                 data["settings"]["plugins"]["rsp"] = value
-            with open('/etc/mupengtk/settings.yaml', 'w') as settings:
+            with open(self.default_path, 'w') as settings:
                 yaml.dump(data, settings)
         except FileNotFoundError:
             print('error')
@@ -110,10 +117,10 @@ class set_settings:
 
     def set_resolution(self, value):
         try:
-            with open('/etc/mupengtk/settings.yaml') as settings:
+            with open(self.default_path) as settings:
                 data = yaml.load(settings, Loader=yaml.FullLoader)
                 data["settings"]["resolution"] = value
-            with open('/etc/mupengtk/settings.yaml', 'w') as settings:
+            with open(self.default_path, 'w') as settings:
                 yaml.dump(data, settings)
         except FileNotFoundError:
             print('error')
@@ -121,10 +128,10 @@ class set_settings:
 
     def set_fullscreen(self, value):
         try:
-            with open('/etc/mupengtk/settings.yaml') as settings:
+            with open(self.default_path) as settings:
                 data = yaml.load(settings, Loader=yaml.FullLoader)
                 data["settings"]["fullscreen"] = value
-            with open('/etc/mupengtk/settings.yaml', 'w') as settings:
+            with open(self.default_path, 'w') as settings:
                 yaml.dump(data, settings)
         except FileNotFoundError:
             print('error')
