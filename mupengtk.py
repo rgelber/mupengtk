@@ -367,7 +367,7 @@ class Application(Gtk.Application):
 
     def do_activate(self):
         self.win = Window(self)
-        self.win.set_icon_from_file('/usr/share/mupengtk/n64vapor.png')
+        self.win.set_icon_from_file('/usr/share/mupengtk/n64.png')
         self.win.show_all()
 
     def do_startup(self):
