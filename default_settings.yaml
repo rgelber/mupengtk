@@ -6,4 +6,4 @@ settings:
     input: /usr/lib64/mupen64plus/mupen64plus-input-sdl.so
     rsp: /usr/lib64/mupen64plus/mupen64plus-rsp-hle.so
   resolution: 1920x1080
-  rom: /mnt/nfs/emulators/n64/games/Bomberman 64 (U).n64
+  rom: ''
