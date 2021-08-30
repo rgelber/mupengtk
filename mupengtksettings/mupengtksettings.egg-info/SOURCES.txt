@@ -1,0 +1,10 @@
+LICENSE
+setup.py
+mupengtksettings/__init__.py
+mupengtksettings/available_settings.py
+mupengtksettings/read_settings.py
+mupengtksettings/set_settings.py
+mupengtksettings.egg-info/PKG-INFO
+mupengtksettings.egg-info/SOURCES.txt
+mupengtksettings.egg-info/dependency_links.txt
+mupengtksettings.egg-info/top_level.txt

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=MupenGTK
+GenericName=Mupen
+Icon=mupengtk
+Exec=mupengtk
+Terminal=true
+Categories=Emulator

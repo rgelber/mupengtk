@@ -1,0 +1,23 @@
+Metadata-Version: 2.1
+Name: mupengtksettings
+Version: 0.1.0
+Summary: Settings file require for MupenGTK
+Home-page: https://github.com/shuds13/pyexample
+Author: Ryan Gelber
+Author-email: ryangelber@gmail.com
+License: GLPv3
+Platform: UNKNOWN
+Classifier: Programming Language :: Python :: 3 :: Only
+Classifier: Programming Language :: Python :: 3.5
+Classifier: Programming Language :: Python :: 3.6
+Classifier: Programming Language :: Python :: 3.7
+Classifier: Programming Language :: Python :: 3.8
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: Implementation :: CPython
+Classifier: Topic :: Software Development :: Libraries :: Python Modules
+Classifier: Topic :: Text Processing :: Markup
+Classifier: Typing :: Typed
+License-File: LICENSE
+
+UNKNOWN
+
