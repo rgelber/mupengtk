@@ -9,7 +9,7 @@ function install_func () {
     sudo cp -f assets/n64.png /usr/share/icons/mupengtk.png
     sudo cp -f bin/mupengtk /usr/local/bin/
     sudo cp -f assets/mupengtk.desktop /usr/share/applications/
-    cd mupengtksettings
+    cd pip/mupengtksettings
     pip3 install -e .
     echo "MupenGTK Installed"
 }
@@ -18,7 +18,7 @@ function uninstall_func () {
     sudo rm /usr/share//icons/mupengtk.png
     sudo rm /usr/local/bin/mupengtk
     sudo rm /usr/share/applications/mupengtk.desktop
-    cd mupengtksettings
+    pip3 uninstall mupengtksettings
     echo "MupenGTK Uninstalled"
 }
 
