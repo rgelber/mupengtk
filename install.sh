@@ -13,6 +13,7 @@ function install_func () {
     pip3 install -e .
     echo "MupenGTK Installed"
 }
+
 function uninstall_func () {
     sudo rm -r /usr/share/mupengtk/
     sudo rm /usr/share//icons/mupengtk.png
