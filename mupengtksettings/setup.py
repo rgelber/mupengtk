@@ -9,7 +9,6 @@ setup(
     author_email='ryangelber@gmail.com',
     license='GLPv3',
     packages=find_packages(),
-
     classifiers=[
         'Programming Language :: Python :: 3 :: Only',
         'Programming Language :: Python :: 3.5',

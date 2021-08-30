@@ -1,7 +1,5 @@
 import os
 import re
-import yaml
-from shutil import copyfile
 
 
 class available_settings:
