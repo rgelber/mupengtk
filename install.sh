@@ -5,10 +5,10 @@ function install_func () {
     if [[ ! -d '/usr/share/mupengtk/' ]]; then
        sudo mkdir '/usr/share/mupengtk/'
     fi
-    sudo cp -f n64.png /usr/share/mupengtk/
-    sudo cp -f n64.png /usr/share/icons/mupengtk.png
-    sudo cp -f mupengtk /usr/local/bin/
-    sudo cp -f mupengtk.desktop /usr/share/applications/
+    sudo cp -f assets/n64.png /usr/share/mupengtk/
+    sudo cp -f assets/n64.png /usr/share/icons/mupengtk.png
+    sudo cp -f bin/mupengtk /usr/local/bin/
+    sudo cp -f assets/mupengtk.desktop /usr/share/applications/
     cd mupengtksettings
     pip3 install -e .
     echo "MupenGTK Installed"
