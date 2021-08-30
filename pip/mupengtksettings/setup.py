@@ -4,7 +4,7 @@ setup(
     name='mupengtksettings',
     version='0.1.0',    
     description='Settings file require for MupenGTK',
-    url='https://github.com/shuds13/pyexample',
+    url='https://git.sierratek.net/rcgelber/mupengtk',
     author='Ryan Gelber',
     author_email='ryangelber@gmail.com',
     license='GLPv3',
