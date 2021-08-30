@@ -295,7 +295,11 @@ class Window(Gtk.ApplicationWindow):
                 f'{read_mupensettings.get_rom()}'
               ]
         print(cmd)
-        self.process = subprocess.Popen(cmd)
+        try:
+            self.process.terminate()
+            self.process = subprocess.Popen(cmd)
+        except AttributeError:
+            self.process = subprocess.Popen(cmd)
         msg = f"{read_mupensettings.get_rom().split('/')[-1]} has started"
         self.statusbar.push(self.context, msg)
 
