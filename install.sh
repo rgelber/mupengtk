@@ -6,7 +6,7 @@ function install_func () {
        sudo mkdir '/usr/share/mupengtk/'
     fi
     sudo cp -f n64.png /usr/share/mupengtk/
-    sudo cp -f n64.png /usr/share//icons/mupengtk.png
+    sudo cp -f n64.png /usr/share/icons/mupengtk.png
     sudo cp -f mupengtk /usr/local/bin/
     sudo cp -f mupengtk.desktop /usr/share/applications/
     cd mupengtksettings

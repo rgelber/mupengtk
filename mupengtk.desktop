@@ -4,5 +4,5 @@ Name=MupenGTK
 GenericName=Mupen
 Icon=mupengtk
 Exec=mupengtk
-Terminal=true
+Terminal=false
 Categories=Emulator

@@ -1,9 +1,0 @@
-settings:
-  fullscreen: false
-  plugins:
-    audio: /usr/lib64/mupen64plus/mupen64plus-audio-sdl.so
-    gfx: /usr/lib64/mupen64plus/mupen64plus-video-glide64mk2.so
-    input: /usr/lib64/mupen64plus/mupen64plus-input-sdl.so
-    rsp: /usr/lib64/mupen64plus/mupen64plus-rsp-hle.so
-  resolution: 1920x1080
-  rom: ''
