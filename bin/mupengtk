@@ -22,6 +22,11 @@ RESOLUTIONS = (
     '1920x1080', '1920x1200', '2048x1152', '2560x1080',
     '2560x1440', '3440x1440', '3840x2160',
 )
+_YDOTOOL_KEYCODES = {
+    '0': 11, '1': 2, '2': 3, '3': 4, '4': 5,
+    '5': 6, '6': 7, '7': 8, '8': 9, '9': 10,
+    'p': 25, 'F5': 63, 'F7': 65,
+}
 ICON_CANDIDATES = (
     '/usr/share/pixmaps/mupengtk.png',
     '/usr/local/share/pixmaps/mupengtk.png',
@@ -267,23 +272,51 @@ class Window(Gtk.ApplicationWindow):
     def _send_key(self, _widget, key):
         if self.process is None or self.process.poll() is not None:
             return
-        if not shutil.which('xdotool'):
-            self.statusbar.push(self.status_ctx, 'xdotool not installed; cannot send key')
+        if self._send_key_xdotool(key):
             return
+        if self._send_key_wayland(key):
+            self.statusbar.push(
+                self.status_ctx, f'Sent {key} to focused window',
+            )
+            return
+        self.statusbar.push(
+            self.status_ctx,
+            'Cannot send key — install xdotool (X11) or wtype/ydotool (Wayland)',
+        )
+
+    def _send_key_xdotool(self, key):
+        if not shutil.which('xdotool'):
+            return False
         try:
             out = subprocess.check_output(
                 ['xdotool', 'search', '--pid', str(self.process.pid)],
                 text=True,
             )
         except subprocess.CalledProcessError:
-            return
+            return False
         windows = out.strip().splitlines()
         if not windows:
-            return
+            return False
         subprocess.run(
             ['xdotool', 'windowactivate', '--sync', windows[-1], 'key', key],
             check=False,
         )
+        return True
+
+    def _send_key_wayland(self, key):
+        if shutil.which('wtype'):
+            subprocess.run(['wtype', '-P', key, '-R', key], check=False)
+            return True
+        if shutil.which('ydotool'):
+            keycode = _YDOTOOL_KEYCODES.get(key)
+            if keycode is None:
+                return False
+            subprocess.run(
+                ['ydotool', 'key', f'{keycode}:1', f'{keycode}:0'],
+                check=False,
+            )
+            return True
+        return False
 
     def _on_slot_activate(self, widget, key):
         if widget.get_active():
