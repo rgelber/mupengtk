@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """MupenGTK — a GTK 3 front-end for mupen64plus."""
 
+import configparser
+import fcntl
+import glob
 import os
 import shutil
+import struct
 import subprocess
 import sys
 
 import gi
 gi.require_version('Gtk', '3.0')
-from gi.repository import Gtk  # noqa: E402
+gi.require_version('Gdk', '3.0')
+from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
 
 import mupengtksettings  # noqa: E402
 
@@ -36,6 +41,70 @@ ICON_CANDIDATES = (
     '/usr/local/share/icons/hicolor/512x512/apps/mupengtk.png',
 )
 
+# mupen64plus.cfg key -> display label
+N64_BUTTONS = (
+    ('A Button',    'A'),
+    ('B Button',    'B'),
+    ('Z Trig',      'Z'),
+    ('Start',       'Start'),
+    ('L Trig',      'L'),
+    ('R Trig',      'R'),
+    ('DPad U',      'D-Pad Up'),
+    ('DPad D',      'D-Pad Down'),
+    ('DPad L',      'D-Pad Left'),
+    ('DPad R',      'D-Pad Right'),
+    ('C Button U',  'C Up'),
+    ('C Button D',  'C Down'),
+    ('C Button L',  'C Left'),
+    ('C Button R',  'C Right'),
+    ('X Axis',      'Stick X (axis)'),
+    ('Y Axis',      'Stick Y (axis)'),
+)
+
+MUPEN64_CFG = os.path.join(
+    os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser('~/.config'),
+    'mupen64plus', 'mupen64plus.cfg',
+)
+CONTROL_SECTION = 'Input-SDL-Control1'
+
+JS_EVENT_BUTTON = 0x01
+JS_EVENT_AXIS = 0x02
+JS_EVENT_INIT = 0x80
+
+CSS = b"""
+.rom-title       { font-size: 20px; font-weight: 700; }
+.rom-none        { color: alpha(@theme_fg_color, 0.55); font-style: italic; }
+.section-label   { font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+.play-button     { padding: 6px 32px; font-weight: 700; }
+.card {
+    background: alpha(@theme_fg_color, 0.03);
+    border-radius: 8px;
+    padding: 16px;
+}
+.status-dot-idle {
+    background: alpha(@theme_fg_color, 0.3);
+    border-radius: 999px;
+    min-width: 10px; min-height: 10px;
+}
+.status-dot-running {
+    background: #43a047;
+    border-radius: 999px;
+    min-width: 10px; min-height: 10px;
+}
+.log-view textview text {
+    background: #101418;
+    color: #cfd8dc;
+    font-family: monospace;
+}
+.binding-value {
+    font-family: monospace;
+    color: alpha(@theme_fg_color, 0.75);
+}
+.binding-capturing {
+    background: alpha(@warning_color, 0.25);
+}
+"""
+
 
 def _find_icon():
     for path in ICON_CANDIDATES:
@@ -44,195 +113,708 @@ def _find_icon():
     return None
 
 
+def _rom_display_name(path):
+    if not path:
+        return ''
+    return os.path.splitext(os.path.basename(path))[0]
+
+
+def _first_joystick():
+    devs = sorted(glob.glob('/dev/input/js*'))
+    return devs[0] if devs else None
+
+
+def _load_bindings():
+    cfg = configparser.ConfigParser(interpolation=None)
+    cfg.optionxform = str
+    if os.path.exists(MUPEN64_CFG):
+        try:
+            cfg.read(MUPEN64_CFG)
+        except configparser.Error:
+            return {}
+    if not cfg.has_section(CONTROL_SECTION):
+        return {}
+    return {k: v.strip('"') for k, v in cfg[CONTROL_SECTION].items()}
+
+
+def _save_binding(button_key, value):
+    os.makedirs(os.path.dirname(MUPEN64_CFG), exist_ok=True)
+    cfg = configparser.ConfigParser(interpolation=None)
+    cfg.optionxform = str
+    if os.path.exists(MUPEN64_CFG):
+        try:
+            cfg.read(MUPEN64_CFG)
+        except configparser.Error:
+            pass
+    if not cfg.has_section(CONTROL_SECTION):
+        cfg.add_section(CONTROL_SECTION)
+        cfg[CONTROL_SECTION]['plugged'] = 'True'
+        cfg[CONTROL_SECTION]['plugin'] = '2'
+        cfg[CONTROL_SECTION]['device'] = '0'
+    cfg[CONTROL_SECTION][button_key] = f'"{value}"'
+    with open(MUPEN64_CFG, 'w') as f:
+        cfg.write(f)
+
+
+class JoystickReader:
+    """Read raw events from /dev/input/jsX (Linux joystick API)."""
+
+    STRUCT = struct.Struct('IhBB')
+
+    def __init__(self, path):
+        self.path = path
+        self.fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        flags = fcntl.fcntl(self.fd, fcntl.F_GETFL)
+        fcntl.fcntl(self.fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+    def read_event(self):
+        try:
+            data = os.read(self.fd, self.STRUCT.size)
+        except BlockingIOError:
+            return None
+        if len(data) < self.STRUCT.size:
+            return None
+        _t, value, type_, number = self.STRUCT.unpack(data)
+        if type_ & JS_EVENT_INIT:
+            return None
+        return (type_ & 0x7F, number, value)
+
+    def drain(self):
+        while self.read_event() is not None:
+            pass
+
+    def close(self):
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+
 class Window(Gtk.ApplicationWindow):
+    LOG_MAX_LINES = 2000
+
     def __init__(self, app):
-        super().__init__(title='MupenGTK', application=app)
-        self.set_default_size(400, 300)
+        super().__init__(application=app, title='MupenGTK')
+        self.set_default_size(1100, 680)
 
         self.settings = mupengtksettings.read_settings()
         self.setter = mupengtksettings.set_settings()
         self.plugins = mupengtksettings.available_settings()
         self.process = None
+        self._poll_source = None
+        self._log_source = None
+        self._binding_reader = None
+        self._binding_source = None
+        self._binding_target = None
+        self._binding_button = None
+        self.binding_rows = {}
 
-        grid = Gtk.Grid()
-        menubar = Gtk.MenuBar()
-        menubar.add(self._build_file_menu())
-        menubar.add(self._build_emulation_menu())
-        menubar.add(self._build_view_menu())
-        menubar.add(self._build_settings_menu())
+        self._install_css()
+        self._build_header()
+        self._build_body()
+        self._refresh_info_panel()
+        self._refresh_binding_rows()
+        self._update_running_state(running=False)
 
-        self.statusbar = Gtk.Statusbar()
-        self.status_ctx = self.statusbar.get_context_id('Status')
+        self._install_accels(app)
+        self.connect('destroy', self._on_destroy)
 
-        grid.attach(menubar, 0, 0, 1, 1)
-        grid.attach(self.statusbar, 0, 1, 2, 2)
-        self.add(grid)
+    # ---------- styling ----------
+    def _install_css(self):
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
 
-    # ---------- menu construction ----------
-    def _build_file_menu(self):
-        menu = Gtk.Menu()
-        header = Gtk.MenuItem.new_with_label('File')
-        header.set_submenu(menu)
+    # ---------- header bar ----------
+    def _build_header(self):
+        hb = Gtk.HeaderBar()
+        hb.set_show_close_button(True)
+        hb.set_title('MupenGTK')
+        hb.set_subtitle('Nintendo 64')
 
-        open_rom = Gtk.MenuItem.new_with_label('Open ROM')
-        rom_menu = Gtk.Menu()
-        open_rom.set_submenu(rom_menu)
-        manual = Gtk.MenuItem.new_with_label('Manually...')
-        manual.connect('activate', self.on_select_rom_manually)
-        rom_menu.append(manual)
-        menu.append(open_rom)
+        self.play_btn = Gtk.Button.new_from_icon_name(
+            'media-playback-start-symbolic', Gtk.IconSize.BUTTON,
+        )
+        self.play_btn.set_tooltip_text('Start (Ctrl+P)')
+        self.play_btn.get_style_context().add_class('suggested-action')
+        self.play_btn.connect('clicked', self.on_start)
+        hb.pack_start(self.play_btn)
 
-        recent = Gtk.MenuItem.new_with_label('Open Recent')
-        chooser = Gtk.RecentChooserMenu()
-        chooser.set_filter(self._recent_filter())
-        chooser.connect('item-activated', self.on_select_rom_recent)
-        recent.set_submenu(chooser)
-        menu.append(recent)
+        self.stop_btn = Gtk.Button.new_from_icon_name(
+            'media-playback-stop-symbolic', Gtk.IconSize.BUTTON,
+        )
+        self.stop_btn.set_tooltip_text('Stop (Ctrl+.)')
+        self.stop_btn.connect('clicked', self.on_stop)
+        hb.pack_start(self.stop_btn)
 
-        slots = Gtk.MenuItem.new_with_label('Save Slots')
-        slots_menu = Gtk.Menu()
-        slots.set_submenu(slots_menu)
-        group = None
-        for i in range(10):
-            item = Gtk.RadioMenuItem(group=group, label=f'Slot {i}')
-            group = group or item
-            item.connect('activate', self._on_slot_activate, str(i))
-            slots_menu.append(item)
-        menu.append(slots)
+        self.pause_btn = Gtk.Button.new_from_icon_name(
+            'media-playback-pause-symbolic', Gtk.IconSize.BUTTON,
+        )
+        self.pause_btn.set_tooltip_text('Pause / Resume (Ctrl+Space)')
+        self.pause_btn.connect('clicked', self._on_pause_clicked)
+        hb.pack_start(self.pause_btn)
 
-        save = Gtk.MenuItem.new_with_label('Save State...')
-        save.connect('activate', self._send_key, 'F5')
-        menu.append(save)
+        self.status_dot = Gtk.Box()
+        self.status_dot.set_valign(Gtk.Align.CENTER)
+        self.status_dot.set_margin_start(8)
+        hb.pack_start(self.status_dot)
 
-        load = Gtk.MenuItem.new_with_label('Load State...')
-        load.connect('activate', self._send_key, 'F7')
-        menu.append(load)
-
-        return header
-
-    def _build_emulation_menu(self):
-        menu = Gtk.Menu()
-        header = Gtk.MenuItem.new_with_label('Emulation')
-        header.set_submenu(menu)
-
-        start = Gtk.MenuItem.new_with_label('Start')
-        start.connect('activate', self.on_start)
-        menu.append(start)
-
-        stop = Gtk.MenuItem.new_with_label('Stop')
-        stop.connect('activate', self.on_stop)
-        menu.append(stop)
-
-        pause = Gtk.MenuItem.new_with_label('Pause')
-        pause.connect('activate', self._send_key, 'p')
-        menu.append(pause)
-
-        return header
-
-    def _build_view_menu(self):
-        menu = Gtk.Menu()
-        header = Gtk.MenuItem.new_with_label('View')
-        header.set_submenu(menu)
-
-        res = Gtk.MenuItem.new_with_label('Resolution')
-        res.set_submenu(self._radio_menu(
-            RESOLUTIONS,
-            self.settings.get_resolution(),
-            self._on_pick_resolution,
+        self.fullscreen_btn = Gtk.ToggleButton()
+        self.fullscreen_btn.set_image(Gtk.Image.new_from_icon_name(
+            'view-fullscreen-symbolic', Gtk.IconSize.BUTTON,
         ))
-        menu.append(res)
+        self.fullscreen_btn.set_tooltip_text('Fullscreen when starting emulation')
+        self.fullscreen_btn.set_active(self.settings.get_fullscreen())
+        self.fullscreen_btn.connect('toggled', self._on_toggle_fullscreen)
+        hb.pack_end(self.fullscreen_btn)
 
-        fullscreen = Gtk.CheckMenuItem.new_with_label('Fullscreen')
-        fullscreen.set_active(self.settings.get_fullscreen())
-        fullscreen.connect('toggled', self._on_toggle_fullscreen)
-        menu.append(fullscreen)
+        menu_btn = Gtk.MenuButton()
+        menu_btn.set_image(Gtk.Image.new_from_icon_name(
+            'open-menu-symbolic', Gtk.IconSize.BUTTON,
+        ))
+        menu_btn.set_tooltip_text('More')
+        menu_btn.set_popup(self._build_menu())
+        hb.pack_end(menu_btn)
 
-        return header
+        self.set_titlebar(hb)
 
-    def _build_settings_menu(self):
+    def _build_menu(self):
         menu = Gtk.Menu()
-        header = Gtk.MenuItem.new_with_label('Settings')
-        header.set_submenu(menu)
+        menu.append(self._build_plugins_item())
+        menu.append(self._build_resolution_item())
+        menu.append(Gtk.SeparatorMenuItem())
+        menu.append(self._build_save_slot_item())
+        save_state = Gtk.MenuItem.new_with_label('Save State (F5)')
+        save_state.connect('activate', self._send_key, 'F5')
+        menu.append(save_state)
+        load_state = Gtk.MenuItem.new_with_label('Load State (F7)')
+        load_state.connect('activate', self._send_key, 'F7')
+        menu.append(load_state)
+        menu.append(Gtk.SeparatorMenuItem())
+        refresh = Gtk.MenuItem.new_with_label('Rescan Plugins')
+        refresh.connect('activate', self._on_rescan_plugins)
+        menu.append(refresh)
+        clear_log = Gtk.MenuItem.new_with_label('Clear Log')
+        clear_log.connect('activate', self._on_clear_log)
+        menu.append(clear_log)
+        menu.show_all()
+        return menu
 
-        plugins_item = Gtk.MenuItem.new_with_label('Plugins')
-        plugins_menu = Gtk.Menu()
-        plugins_item.set_submenu(plugins_menu)
-
+    def _build_plugins_item(self):
+        item = Gtk.MenuItem.new_with_label('Plugins')
+        sub = Gtk.Menu()
         specs = (
             ('Graphics', self.plugins.get_video_plugins(),
-             self.settings.get_plugin_gfx(), self.setter.set_gfx),
+             self.settings.get_plugin_gfx(), 'gfx'),
             ('Audio', self.plugins.get_audio_plugins(),
-             self.settings.get_plugin_audio(), self.setter.set_audio),
+             self.settings.get_plugin_audio(), 'audio'),
             ('Input', self.plugins.get_input_plugins(),
-             self.settings.get_plugin_input(), self.setter.set_input),
-            ('Rsp', self.plugins.get_rsp_plugins(),
-             self.settings.get_plugin_rsp(), self.setter.set_rsp),
+             self.settings.get_plugin_input(), 'input'),
+            ('RSP', self.plugins.get_rsp_plugins(),
+             self.settings.get_plugin_rsp(), 'rsp'),
         )
-        for label, options, current, setter in specs:
-            item = Gtk.MenuItem.new_with_label(label)
-            item.set_submenu(self._radio_menu(
-                options, current, self._make_picker(setter, label),
-            ))
-            plugins_menu.append(item)
+        for label, options, current, key in specs:
+            entry = Gtk.MenuItem.new_with_label(label)
+            entry.set_submenu(self._radio_menu(options, current, key))
+            sub.append(entry)
+        item.set_submenu(sub)
+        return item
 
-        menu.append(plugins_item)
-        return header
+    def _build_resolution_item(self):
+        item = Gtk.MenuItem.new_with_label('Resolution')
+        item.set_submenu(
+            self._radio_menu(RESOLUTIONS, self.settings.get_resolution(), 'resolution')
+        )
+        return item
 
-    def _radio_menu(self, options, current, on_toggle):
+    def _build_save_slot_item(self):
+        item = Gtk.MenuItem.new_with_label('Save Slots (0–9)')
+        sub = Gtk.Menu()
+        group = None
+        for i in range(10):
+            slot = Gtk.RadioMenuItem(group=group, label=f'Slot {i}')
+            group = group or slot
+            slot.connect('activate', self._on_slot_activate, str(i))
+            sub.append(slot)
+        item.set_submenu(sub)
+        return item
+
+    def _radio_menu(self, options, current, kind):
         menu = Gtk.Menu()
+        if not options:
+            empty = Gtk.MenuItem.new_with_label('(none installed)')
+            empty.set_sensitive(False)
+            menu.append(empty)
+            return menu
         group = None
         for opt in options:
             item = Gtk.RadioMenuItem(group=group, label=opt)
             group = group or item
             if opt == current:
                 item.set_active(True)
-            item.connect('toggled', on_toggle)
+            item.connect('toggled', self._on_option_toggled, kind)
             menu.append(item)
         return menu
 
-    @staticmethod
-    def _recent_filter():
-        f = Gtk.RecentFilter()
-        for pattern in ROM_PATTERNS:
-            f.add_pattern(pattern)
-        return f
+    # ---------- body ----------
+    def _build_body(self):
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
 
-    def _make_picker(self, setter, label):
-        def handler(widget):
-            if not widget.get_active():
-                return
-            setter(widget.get_label())
-            self.statusbar.push(self.status_ctx, f'{label}: {widget.get_label()}')
-        return handler
+        paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        paned.set_position(560)
+        paned.set_wide_handle(True)
+        paned.pack1(self._build_rom_browser(), resize=True, shrink=False)
+        paned.pack2(self._build_right_pane(), resize=True, shrink=False)
+        root.pack_start(paned, True, True, 0)
+
+        self.statusbar = Gtk.Statusbar()
+        self.status_ctx = self.statusbar.get_context_id('Status')
+        root.pack_start(self.statusbar, False, False, 0)
+
+        self.add(root)
+
+    def _build_rom_browser(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_margin_top(10)
+        box.set_margin_bottom(10)
+        box.set_margin_start(10)
+        box.set_margin_end(6)
+
+        header = Gtk.Label(label='ROM LIBRARY', xalign=0)
+        header.get_style_context().add_class('section-label')
+        header.get_style_context().add_class('dim-label')
+        box.pack_start(header, False, False, 0)
+
+        self.chooser = Gtk.FileChooserWidget.new(Gtk.FileChooserAction.OPEN)
+        self.chooser.set_local_only(True)
+        self.chooser.set_hexpand(True)
+        self.chooser.set_vexpand(True)
+
+        rom_filter = Gtk.FileFilter()
+        rom_filter.set_name('N64 ROMs (.n64 .z64 .v64)')
+        for p in ROM_PATTERNS:
+            rom_filter.add_pattern(p)
+        self.chooser.add_filter(rom_filter)
+        any_filter = Gtk.FileFilter()
+        any_filter.set_name('All files')
+        any_filter.add_pattern('*')
+        self.chooser.add_filter(any_filter)
+
+        current = self.settings.get_rom()
+        if current and os.path.isfile(current):
+            self.chooser.set_filename(current)
+        elif current and os.path.isdir(os.path.dirname(current)):
+            self.chooser.set_current_folder(os.path.dirname(current))
+
+        self.chooser.connect('selection-changed', self._on_rom_selected)
+        self.chooser.connect('file-activated', self._on_rom_activated)
+        box.pack_start(self.chooser, True, True, 0)
+
+        return box
+
+    def _build_right_pane(self):
+        notebook = Gtk.Notebook()
+        notebook.set_margin_top(8)
+        notebook.set_margin_bottom(8)
+        notebook.set_margin_end(10)
+        notebook.set_margin_start(4)
+        notebook.append_page(self._build_info_tab(), Gtk.Label(label='Info'))
+        notebook.append_page(self._build_log_tab(), Gtk.Label(label='Log'))
+        notebook.append_page(self._build_controls_tab(), Gtk.Label(label='Controls'))
+        return notebook
+
+    def _build_info_tab(self):
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        outer.set_margin_top(16)
+        outer.set_margin_bottom(16)
+        outer.set_margin_start(12)
+        outer.set_margin_end(12)
+
+        section = Gtk.Label(label='NOW PLAYING', xalign=0)
+        section.get_style_context().add_class('section-label')
+        section.get_style_context().add_class('dim-label')
+        outer.pack_start(section, False, False, 0)
+
+        self.rom_title = Gtk.Label(xalign=0)
+        self.rom_title.get_style_context().add_class('rom-title')
+        self.rom_title.set_line_wrap(True)
+        outer.pack_start(self.rom_title, False, False, 0)
+
+        self.rom_path = Gtk.Label(xalign=0)
+        self.rom_path.get_style_context().add_class('dim-label')
+        self.rom_path.set_line_wrap(True)
+        self.rom_path.set_selectable(True)
+        outer.pack_start(self.rom_path, False, False, 0)
+
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        card.get_style_context().add_class('card')
+
+        card_title = Gtk.Label(label='CONFIGURATION', xalign=0)
+        card_title.get_style_context().add_class('section-label')
+        card_title.get_style_context().add_class('dim-label')
+        card.pack_start(card_title, False, False, 0)
+
+        grid = Gtk.Grid()
+        grid.set_column_spacing(14)
+        grid.set_row_spacing(6)
+        grid.set_margin_top(4)
+        self.info_labels = {}
+        rows = (
+            ('Resolution', 'resolution'),
+            ('Graphics',   'gfx'),
+            ('Audio',      'audio'),
+            ('Input',      'input'),
+            ('RSP',        'rsp'),
+            ('Mode',       'mode'),
+        )
+        for i, (label, key) in enumerate(rows):
+            k = Gtk.Label(label=label, xalign=1)
+            k.get_style_context().add_class('dim-label')
+            grid.attach(k, 0, i, 1, 1)
+            v = Gtk.Label(xalign=0)
+            v.set_line_wrap(True)
+            v.set_selectable(True)
+            grid.attach(v, 1, i, 1, 1)
+            self.info_labels[key] = v
+        card.pack_start(grid, False, False, 0)
+        outer.pack_start(card, False, False, 0)
+
+        self.big_play = Gtk.Button.new_with_label('Play')
+        self.big_play.get_style_context().add_class('suggested-action')
+        self.big_play.get_style_context().add_class('play-button')
+        self.big_play.set_halign(Gtk.Align.START)
+        self.big_play.connect('clicked', self.on_start)
+        outer.pack_start(self.big_play, False, False, 0)
+
+        return outer
+
+    def _build_log_tab(self):
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        outer.set_margin_top(8)
+        outer.set_margin_bottom(8)
+        outer.set_margin_start(8)
+        outer.set_margin_end(8)
+
+        header_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        header = Gtk.Label(label='EMULATOR OUTPUT', xalign=0)
+        header.get_style_context().add_class('section-label')
+        header.get_style_context().add_class('dim-label')
+        header_row.pack_start(header, True, True, 0)
+        clear_btn = Gtk.Button.new_from_icon_name('edit-clear-symbolic', Gtk.IconSize.BUTTON)
+        clear_btn.set_tooltip_text('Clear log')
+        clear_btn.connect('clicked', self._on_clear_log)
+        header_row.pack_end(clear_btn, False, False, 0)
+        outer.pack_start(header_row, False, False, 0)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        self.log_view = Gtk.TextView()
+        self.log_view.set_editable(False)
+        self.log_view.set_cursor_visible(False)
+        self.log_view.set_monospace(True)
+        self.log_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.log_view.get_style_context().add_class('log-view')
+        self.log_buffer = self.log_view.get_buffer()
+        scroll.add(self.log_view)
+        outer.pack_start(scroll, True, True, 0)
+        return outer
+
+    def _build_controls_tab(self):
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        outer.set_margin_top(10)
+        outer.set_margin_bottom(10)
+        outer.set_margin_start(10)
+        outer.set_margin_end(10)
+
+        header = Gtk.Label(label='CONTROLLER (Player 1)', xalign=0)
+        header.get_style_context().add_class('section-label')
+        header.get_style_context().add_class('dim-label')
+        outer.pack_start(header, False, False, 0)
+
+        self.controls_status = Gtk.Label(xalign=0)
+        self.controls_status.get_style_context().add_class('dim-label')
+        self.controls_status.set_line_wrap(True)
+        outer.pack_start(self.controls_status, False, False, 0)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_hexpand(True)
+        scroll.set_vexpand(True)
+
+        grid = Gtk.Grid()
+        grid.set_column_spacing(12)
+        grid.set_row_spacing(6)
+        grid.set_margin_top(6)
+        grid.set_margin_bottom(6)
+
+        for i, (key, label) in enumerate(N64_BUTTONS):
+            name_lbl = Gtk.Label(label=label, xalign=0)
+            name_lbl.set_hexpand(False)
+            grid.attach(name_lbl, 0, i, 1, 1)
+
+            value_lbl = Gtk.Label(label='(unbound)', xalign=0)
+            value_lbl.get_style_context().add_class('binding-value')
+            value_lbl.set_hexpand(True)
+            grid.attach(value_lbl, 1, i, 1, 1)
+
+            assign_btn = Gtk.Button.new_with_label('Bind')
+            assign_btn.set_tooltip_text('Press to capture the next gamepad input')
+            assign_btn.connect('clicked', self._on_bind_clicked, key)
+            grid.attach(assign_btn, 2, i, 1, 1)
+
+            clear_btn = Gtk.Button.new_from_icon_name(
+                'edit-clear-symbolic', Gtk.IconSize.BUTTON,
+            )
+            clear_btn.set_tooltip_text('Clear binding')
+            clear_btn.connect('clicked', self._on_clear_binding, key)
+            grid.attach(clear_btn, 3, i, 1, 1)
+
+            self.binding_rows[key] = (value_lbl, assign_btn)
+
+        scroll.add(grid)
+        outer.pack_start(scroll, True, True, 0)
+
+        footer = Gtk.Label(xalign=0)
+        footer.set_line_wrap(True)
+        footer.get_style_context().add_class('dim-label')
+        footer.set_text(
+            'Bindings are written to ~/.config/mupen64plus/mupen64plus.cfg '
+            'and take effect the next time you start a ROM.'
+        )
+        outer.pack_start(footer, False, False, 0)
+
+        return outer
+
+    # ---------- state / refresh ----------
+    def _refresh_info_panel(self):
+        rom = self.settings.get_rom()
+        if rom:
+            self.rom_title.set_text(_rom_display_name(rom))
+            self.rom_title.get_style_context().remove_class('rom-none')
+            self.rom_path.set_text(rom)
+            self.big_play.set_sensitive(True)
+        else:
+            self.rom_title.set_text('No ROM selected')
+            self.rom_title.get_style_context().add_class('rom-none')
+            self.rom_path.set_text('Choose a ROM from the library to get started')
+            self.big_play.set_sensitive(False)
+
+        def basename_or_none(p):
+            return os.path.basename(p) if p else '—'
+
+        self.info_labels['resolution'].set_text(self.settings.get_resolution() or '—')
+        self.info_labels['gfx'].set_text(basename_or_none(self.settings.get_plugin_gfx()))
+        self.info_labels['audio'].set_text(basename_or_none(self.settings.get_plugin_audio()))
+        self.info_labels['input'].set_text(basename_or_none(self.settings.get_plugin_input()))
+        self.info_labels['rsp'].set_text(basename_or_none(self.settings.get_plugin_rsp()))
+        self.info_labels['mode'].set_text(
+            'Fullscreen' if self.settings.get_fullscreen() else 'Windowed'
+        )
+
+    def _reload_settings(self):
+        self.settings = mupengtksettings.read_settings()
+        self._refresh_info_panel()
+
+    def _refresh_binding_rows(self):
+        bindings = _load_bindings()
+        for key, (label, _btn) in self.binding_rows.items():
+            label.set_text(bindings.get(key, '(unbound)'))
+        js = _first_joystick()
+        if js:
+            self.controls_status.set_text(f'Gamepad detected at {js}. Click Bind, then press a button or move a stick.')
+        else:
+            self.controls_status.set_text(
+                'No gamepad detected under /dev/input/js*. Connect one and reopen this tab.'
+            )
+
+    def _update_running_state(self, running):
+        ctx = self.status_dot.get_style_context()
+        ctx.remove_class('status-dot-idle')
+        ctx.remove_class('status-dot-running')
+        ctx.add_class('status-dot-running' if running else 'status-dot-idle')
+        self.stop_btn.set_sensitive(running)
+        self.pause_btn.set_sensitive(running)
+        self.play_btn.set_sensitive(not running and bool(self.settings.get_rom()))
+        if hasattr(self, 'big_play'):
+            self.big_play.set_sensitive(not running and bool(self.settings.get_rom()))
+
+    def _start_poll(self):
+        if self._poll_source is not None:
+            return
+        self._poll_source = GLib.timeout_add_seconds(1, self._poll_process)
+
+    def _poll_process(self):
+        if self.process is None:
+            self._poll_source = None
+            return False
+        if self.process.poll() is not None:
+            code = self.process.returncode
+            self._teardown_process(code)
+            return False
+        return True
+
+    def _teardown_process(self, code):
+        if self._log_source is not None:
+            GLib.source_remove(self._log_source)
+            self._log_source = None
+        if self.process and self.process.stdout:
+            try:
+                self.process.stdout.close()
+            except Exception:
+                pass
+        self.process = None
+        self._update_running_state(running=False)
+        self.statusbar.push(self.status_ctx, f'Emulation ended (exit {code})')
+        self._append_log(f'\n[mupengtk] process exited with code {code}\n')
+        self._poll_source = None
+
+    # ---------- accelerators ----------
+    def _install_accels(self, app):
+        accels = (
+            ('play',       ['<Primary>p']),
+            ('stop',       ['<Primary>period']),
+            ('pause',      ['<Primary>space']),
+            ('fullscreen', ['F11']),
+        )
+        for name, keys in accels:
+            action = Gio.SimpleAction.new(name, None)
+            action.connect('activate', self._on_accel, name)
+            self.add_action(action)
+            app.set_accels_for_action(f'win.{name}', keys)
+
+    def _on_accel(self, _action, _param, name):
+        if name == 'play':
+            self.on_start(None)
+        elif name == 'stop':
+            self.on_stop(None)
+        elif name == 'pause':
+            self._on_pause_clicked(None)
+        elif name == 'fullscreen':
+            self.fullscreen_btn.set_active(not self.fullscreen_btn.get_active())
 
     # ---------- handlers ----------
-    def on_select_rom_manually(self, _widget):
-        dialog = Gtk.FileChooserDialog(
-            title='Select ROM...', parent=self,
-            action=Gtk.FileChooserAction.OPEN,
-        )
-        rom_filter = Gtk.FileFilter()
-        rom_filter.set_name('N64 ROMs')
-        for pattern in ROM_PATTERNS:
-            rom_filter.add_pattern(pattern)
-        dialog.add_filter(rom_filter)
-        dialog.add_button('_Cancel', Gtk.ResponseType.CANCEL)
-        dialog.add_button('_Open', Gtk.ResponseType.OK)
-        dialog.set_default_response(Gtk.ResponseType.OK)
-        if dialog.run() == Gtk.ResponseType.OK:
-            path = dialog.get_filename()
-            self.setter.set_rom(path)
-            self.statusbar.push(self.status_ctx, f'Selected: {os.path.basename(path)}')
-        dialog.destroy()
-
-    def on_select_rom_recent(self, widget):
-        item = widget.get_current_item()
-        path = item.get_uri_display()
+    def _on_rom_selected(self, chooser):
+        path = chooser.get_filename()
+        if not path or not os.path.isfile(path):
+            return
+        if path == self.settings.get_rom():
+            return
         self.setter.set_rom(path)
+        self._reload_settings()
         self.statusbar.push(self.status_ctx, f'Selected: {os.path.basename(path)}')
 
+    def _on_rom_activated(self, _chooser):
+        self.on_start(None)
+
+    def _on_option_toggled(self, widget, kind):
+        if not widget.get_active():
+            return
+        value = widget.get_label()
+        {
+            'gfx': self.setter.set_gfx,
+            'audio': self.setter.set_audio,
+            'input': self.setter.set_input,
+            'rsp': self.setter.set_rsp,
+            'resolution': self.setter.set_resolution,
+        }[kind](value)
+        self._reload_settings()
+        self.statusbar.push(self.status_ctx, f'{kind}: {os.path.basename(value)}')
+
+    def _on_toggle_fullscreen(self, widget):
+        self.setter.set_fullscreen(widget.get_active())
+        self._reload_settings()
+
+    def _on_slot_activate(self, widget, key):
+        if widget.get_active():
+            self._send_key(widget, key)
+
+    def _on_pause_clicked(self, _widget):
+        self._send_key(None, 'p')
+
+    def _on_rescan_plugins(self, _widget):
+        self.plugins = mupengtksettings.available_settings()
+        counts = sum(len(getattr(self.plugins, f'get_{k}_plugins')())
+                     for k in ('video', 'audio', 'input', 'rsp'))
+        self.statusbar.push(self.status_ctx, f'Rescanned plugins ({counts} found)')
+
+    # ---------- binding ----------
+    def _on_bind_clicked(self, button, key):
+        js = _first_joystick()
+        if not js:
+            self.statusbar.push(self.status_ctx, 'No gamepad detected')
+            return
+        self._cancel_binding()
+        try:
+            self._binding_reader = JoystickReader(js)
+        except OSError as e:
+            self.statusbar.push(self.status_ctx, f'Could not open {js}: {e}')
+            return
+        # Discard synthetic init events and any queued ones
+        for _ in range(200):
+            if self._binding_reader.read_event() is None:
+                break
+        self._binding_target = key
+        self._binding_button = button
+        button.set_label('Press…')
+        button.get_style_context().add_class('binding-capturing')
+        self._binding_source = GLib.timeout_add(30, self._poll_binding)
+        self.statusbar.push(self.status_ctx, f'Press a button/stick for {key}…')
+
+    def _cancel_binding(self):
+        if self._binding_source is not None:
+            GLib.source_remove(self._binding_source)
+            self._binding_source = None
+        if self._binding_reader is not None:
+            self._binding_reader.close()
+            self._binding_reader = None
+        if self._binding_button is not None:
+            self._binding_button.set_label('Bind')
+            self._binding_button.get_style_context().remove_class('binding-capturing')
+            self._binding_button = None
+        self._binding_target = None
+
+    def _poll_binding(self):
+        if self._binding_reader is None:
+            return False
+        ev = self._binding_reader.read_event()
+        if ev is None:
+            return True
+        type_, number, value = ev
+        binding = None
+        if type_ == JS_EVENT_BUTTON and value == 1:
+            binding = f'button({number})'
+        elif type_ == JS_EVENT_AXIS and abs(value) > 20000:
+            sign = '+' if value > 0 else '-'
+            binding = f'axis({number}{sign})'
+        if binding is None:
+            return True
+        target = self._binding_target
+        try:
+            _save_binding(target, binding)
+        except OSError as e:
+            self.statusbar.push(self.status_ctx, f'Failed to save binding: {e}')
+        else:
+            self.statusbar.push(self.status_ctx, f'{target} ← {binding}')
+        self._cancel_binding()
+        self._refresh_binding_rows()
+        return False
+
+    def _on_clear_binding(self, _btn, key):
+        try:
+            _save_binding(key, '')
+        except OSError as e:
+            self.statusbar.push(self.status_ctx, f'Failed to clear binding: {e}')
+        else:
+            self.statusbar.push(self.status_ctx, f'{key} cleared')
+        self._refresh_binding_rows()
+
+    # ---------- emulator process ----------
     def on_start(self, _widget):
-        settings = mupengtksettings.read_settings()
+        self._reload_settings()
+        settings = self.settings
         rom = settings.get_rom()
         if not rom:
             self.statusbar.push(self.status_ctx, 'No ROM selected')
@@ -254,30 +836,97 @@ class Window(Gtk.ApplicationWindow):
         cmd.append(rom)
 
         self._terminate_process()
-        self.process = subprocess.Popen(cmd)
-        self.statusbar.push(self.status_ctx, f'{os.path.basename(rom)} has started')
+        self._append_log(f'\n[mupengtk] launching: {" ".join(cmd)}\n')
+        try:
+            self.process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=0,
+            )
+        except OSError as e:
+            self.statusbar.push(self.status_ctx, f'Failed to launch: {e}')
+            self._append_log(f'[mupengtk] launch failed: {e}\n')
+            return
+
+        self._attach_log_watch(self.process.stdout.fileno())
+        self._update_running_state(running=True)
+        self._start_poll()
+        self.statusbar.push(self.status_ctx, f'Started {os.path.basename(rom)}')
 
     def on_stop(self, _widget):
         if self._terminate_process():
+            self._update_running_state(running=False)
             self.statusbar.push(self.status_ctx, 'Emulation stopped')
 
     def _terminate_process(self):
         if self.process is None or self.process.poll() is not None:
+            if self._log_source is not None:
+                GLib.source_remove(self._log_source)
+                self._log_source = None
             self.process = None
             return False
         self.process.terminate()
+        try:
+            self.process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+        if self._log_source is not None:
+            GLib.source_remove(self._log_source)
+            self._log_source = None
         self.process = None
         return True
 
+    # ---------- log capture ----------
+    def _attach_log_watch(self, fd):
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        self._log_source = GLib.io_add_watch(
+            fd,
+            GLib.PRIORITY_DEFAULT,
+            GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR,
+            self._on_log_read,
+        )
+
+    def _on_log_read(self, fd, condition):
+        try:
+            data = os.read(fd, 4096)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
+        if not data:
+            return False
+        self._append_log(data.decode('utf-8', errors='replace'))
+        return True
+
+    def _append_log(self, text):
+        if not hasattr(self, 'log_buffer'):
+            return
+        end = self.log_buffer.get_end_iter()
+        self.log_buffer.insert(end, text)
+        # Trim to LOG_MAX_LINES
+        line_count = self.log_buffer.get_line_count()
+        if line_count > self.LOG_MAX_LINES:
+            start = self.log_buffer.get_start_iter()
+            cut = self.log_buffer.get_iter_at_line(line_count - self.LOG_MAX_LINES)
+            self.log_buffer.delete(start, cut)
+        mark = self.log_buffer.get_insert()
+        self.log_view.scroll_mark_onscreen(mark)
+
+    def _on_clear_log(self, _widget):
+        if hasattr(self, 'log_buffer'):
+            self.log_buffer.set_text('')
+
+    # ---------- keyboard signalling ----------
     def _send_key(self, _widget, key):
         if self.process is None or self.process.poll() is not None:
+            self.statusbar.push(self.status_ctx, 'Emulator is not running')
             return
         if self._send_key_xdotool(key):
             return
         if self._send_key_wayland(key):
-            self.statusbar.push(
-                self.status_ctx, f'Sent {key} to focused window',
-            )
+            self.statusbar.push(self.status_ctx, f'Sent {key} to focused window')
             return
         self.statusbar.push(
             self.status_ctx,
@@ -318,19 +967,10 @@ class Window(Gtk.ApplicationWindow):
             return True
         return False
 
-    def _on_slot_activate(self, widget, key):
-        if widget.get_active():
-            self._send_key(widget, key)
-
-    def _on_pick_resolution(self, widget):
-        if widget.get_active():
-            self.setter.set_resolution(widget.get_label())
-            self.statusbar.push(self.status_ctx, f'Resolution: {widget.get_label()}')
-
-    def _on_toggle_fullscreen(self, widget):
-        self.setter.set_fullscreen(widget.get_active())
-        state = 'on' if widget.get_active() else 'off'
-        self.statusbar.push(self.status_ctx, f'Fullscreen: {state}')
+    # ---------- lifecycle ----------
+    def _on_destroy(self, _widget):
+        self._cancel_binding()
+        self._terminate_process()
 
 
 class Application(Gtk.Application):
