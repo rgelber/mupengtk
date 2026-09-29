@@ -262,14 +262,24 @@ class Window(Gtk.ApplicationWindow):
         self.status_dot.set_margin_start(8)
         hb.pack_start(self.status_dot)
 
-        self.fullscreen_btn = Gtk.ToggleButton()
+        self.fullscreen_btn = Gtk.ToggleButton(label='Fullscreen')
         self.fullscreen_btn.set_image(Gtk.Image.new_from_icon_name(
             'view-fullscreen-symbolic', Gtk.IconSize.BUTTON,
         ))
+        self.fullscreen_btn.set_always_show_image(True)
         self.fullscreen_btn.set_tooltip_text('Fullscreen when starting emulation')
         self.fullscreen_btn.set_active(self.settings.get_fullscreen())
         self.fullscreen_btn.connect('toggled', self._on_toggle_fullscreen)
         hb.pack_end(self.fullscreen_btn)
+
+        self.controls_btn = Gtk.MenuButton(label='Controls')
+        self.controls_btn.set_image(Gtk.Image.new_from_icon_name(
+            'input-gaming-symbolic', Gtk.IconSize.BUTTON,
+        ))
+        self.controls_btn.set_always_show_image(True)
+        self.controls_btn.set_tooltip_text('Configure controller (applies to all ROMs)')
+        self.controls_btn.set_popover(self._build_controls_popover())
+        hb.pack_end(self.controls_btn)
 
         menu_btn = Gtk.MenuButton()
         menu_btn.set_image(Gtk.Image.new_from_icon_name(
@@ -423,7 +433,6 @@ class Window(Gtk.ApplicationWindow):
         notebook.set_margin_start(4)
         notebook.append_page(self._build_info_tab(), Gtk.Label(label='Info'))
         notebook.append_page(self._build_log_tab(), Gtk.Label(label='Log'))
-        notebook.append_page(self._build_controls_tab(), Gtk.Label(label='Controls'))
         return notebook
 
     def _build_info_tab(self):
@@ -522,12 +531,16 @@ class Window(Gtk.ApplicationWindow):
         outer.pack_start(scroll, True, True, 0)
         return outer
 
-    def _build_controls_tab(self):
+    def _build_controls_popover(self):
+        popover = Gtk.Popover()
+        popover.set_size_request(420, 520)
+        popover.connect('show', lambda _p: self._refresh_binding_rows())
+
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        outer.set_margin_top(10)
-        outer.set_margin_bottom(10)
-        outer.set_margin_start(10)
-        outer.set_margin_end(10)
+        outer.set_margin_top(12)
+        outer.set_margin_bottom(12)
+        outer.set_margin_start(12)
+        outer.set_margin_end(12)
 
         header = Gtk.Label(label='CONTROLLER (Player 1)', xalign=0)
         header.get_style_context().add_class('section-label')
@@ -552,7 +565,6 @@ class Window(Gtk.ApplicationWindow):
 
         for i, (key, label) in enumerate(N64_BUTTONS):
             name_lbl = Gtk.Label(label=label, xalign=0)
-            name_lbl.set_hexpand(False)
             grid.attach(name_lbl, 0, i, 1, 1)
 
             value_lbl = Gtk.Label(label='(unbound)', xalign=0)
@@ -581,12 +593,14 @@ class Window(Gtk.ApplicationWindow):
         footer.set_line_wrap(True)
         footer.get_style_context().add_class('dim-label')
         footer.set_text(
-            'Bindings are written to ~/.config/mupen64plus/mupen64plus.cfg '
-            'and take effect the next time you start a ROM.'
+            'Bindings are global (mupen64plus.cfg) and apply to every ROM. '
+            'Restart the emulator to pick up new bindings.'
         )
         outer.pack_start(footer, False, False, 0)
 
-        return outer
+        popover.add(outer)
+        outer.show_all()
+        return popover
 
     # ---------- state / refresh ----------
     def _refresh_info_panel(self):
@@ -852,7 +866,24 @@ class Window(Gtk.ApplicationWindow):
         self._attach_log_watch(self.process.stdout.fileno())
         self._update_running_state(running=True)
         self._start_poll()
-        self.statusbar.push(self.status_ctx, f'Started {os.path.basename(rom)}')
+        self._launch_pid = self.process.pid
+        self.statusbar.push(
+            self.status_ctx,
+            f'Started {os.path.basename(rom)} (pid {self.process.pid})',
+        )
+        # Detect very-quick exit and surface it prominently
+        GLib.timeout_add_seconds(2, self._check_quick_exit, self.process.pid)
+
+    def _check_quick_exit(self, pid):
+        if self.process is None or self.process.pid != pid:
+            return False
+        code = self.process.poll()
+        if code is not None and code != 0:
+            self.statusbar.push(
+                self.status_ctx,
+                f'mupen64plus exited quickly (code {code}) — check the Log tab',
+            )
+        return False
 
     def on_stop(self, _widget):
         if self._terminate_process():
