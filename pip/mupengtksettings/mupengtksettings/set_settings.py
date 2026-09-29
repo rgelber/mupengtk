@@ -1,92 +1,57 @@
-import os
+"""Write MupenGTK user settings back to the YAML config."""
+
 import yaml
+
+from .read_settings import CONFIG_PATH, ensure_config
+
+
+_KEY_PATHS = {
+    'rom': ('rom',),
+    'gfx': ('plugins', 'gfx'),
+    'audio': ('plugins', 'audio'),
+    'input': ('plugins', 'input'),
+    'rsp': ('plugins', 'rsp'),
+    'resolution': ('resolution',),
+    'fullscreen': ('fullscreen',),
+}
 
 
 class set_settings:
     def __init__(self):
-        default_dir = os.path.expanduser('~/.config/mupengtk')
-        self.default_path = default_dir + "/settings.yaml"
-        self.rom = 'data["settings"]["rom"]'
-        self.gfx = 'data["settings"]["plugins"]["gfx"]'
-        self.audio = 'data["settings"]["plugins"]["audio"]'
-        self.input = 'data["settings"]["plugins"]["input"]'
-        self.rsp = 'data["settings"]["plugins"]["rsp"]'
-        self.resolution = 'data["settings"]["resolution"]'
-        self.fullscreen = 'data["settings"]["fullscreen"]'
+        ensure_config()
+        self.default_path = CONFIG_PATH
+
+    def _update(self, key, value):
+        with open(self.default_path) as f:
+            data = yaml.safe_load(f) or {}
+        node = data.setdefault('settings', {})
+        path = _KEY_PATHS[key]
+        for step in path[:-1]:
+            node = node.setdefault(step, {})
+        node[path[-1]] = value
+        with open(self.default_path, 'w') as f:
+            yaml.safe_dump(data, f)
 
     def set_rom(self, value):
-        try:
-            with open(self.default_path) as settings:
-                data = yaml.load(settings, Loader=yaml.FullLoader)
-                data["settings"]["rom"] = value
-            with open(self.default_path, 'w') as settings:
-                yaml.dump(data, settings)
-        except FileNotFoundError:
-            print('error')
-            pass
+        self._update('rom', value)
 
     def set_gfx(self, value):
-        try:
-            with open(self.default_path) as settings:
-                data = yaml.load(settings, Loader=yaml.FullLoader)
-                data["settings"]["plugins"]["gfx"] = value
-            with open(self.default_path, 'w') as settings:
-                yaml.dump(data, settings)
-        except FileNotFoundError:
-            print('error')
-            pass
+        self._update('gfx', value)
 
     def set_audio(self, value):
-        try:
-            with open(self.default_path) as settings:
-                data = yaml.load(settings, Loader=yaml.FullLoader)
-                data["settings"]["plugins"]["audio"] = value
-            with open(self.default_path, 'w') as settings:
-                yaml.dump(data, settings)
-        except FileNotFoundError:
-            print('error')
-            pass
+        self._update('audio', value)
 
     def set_input(self, value):
-        try:
-            with open(self.default_path) as settings:
-                data = yaml.load(settings, Loader=yaml.FullLoader)
-                data["settings"]["plugins"]["input"] = value
-            with open(self.default_path, 'w') as settings:
-                yaml.dump(data, settings)
-        except FileNotFoundError:
-            print('error')
-            pass
+        self._update('input', value)
 
     def set_rsp(self, value):
-        try:
-            with open(self.default_path) as settings:
-                data = yaml.load(settings, Loader=yaml.FullLoader)
-                data["settings"]["plugins"]["rsp"] = value
-            with open(self.default_path, 'w') as settings:
-                yaml.dump(data, settings)
-        except FileNotFoundError:
-            print('error')
-            pass
+        self._update('rsp', value)
 
     def set_resolution(self, value):
-        try:
-            with open(self.default_path) as settings:
-                data = yaml.load(settings, Loader=yaml.FullLoader)
-                data["settings"]["resolution"] = value
-            with open(self.default_path, 'w') as settings:
-                yaml.dump(data, settings)
-        except FileNotFoundError:
-            print('error')
-            pass
+        self._update('resolution', value)
 
     def set_fullscreen(self, value):
-        try:
-            with open(self.default_path) as settings:
-                data = yaml.load(settings, Loader=yaml.FullLoader)
-                data["settings"]["fullscreen"] = value
-            with open(self.default_path, 'w') as settings:
-                yaml.dump(data, settings)
-        except FileNotFoundError:
-            print('error')
-            pass
+        self._update('fullscreen', bool(value))
+
+
+SettingsWriter = set_settings

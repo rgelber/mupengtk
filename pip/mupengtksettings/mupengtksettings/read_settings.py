@@ -1,49 +1,61 @@
+"""Read MupenGTK user settings, populating sensible defaults on first run."""
+
 import os
+
 import yaml
+
+from .available_settings import available_settings
+
+
+CONFIG_DIR = os.path.join(
+    os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser('~/.config'),
+    'mupengtk',
+)
+CONFIG_PATH = os.path.join(CONFIG_DIR, 'settings.yaml')
+
+
+def _first(items):
+    return items[0] if items else ''
+
+
+def _default_settings():
+    plugins = available_settings()
+    return {
+        'settings': {
+            'fullscreen': False,
+            'plugins': {
+                'audio': _first(plugins.get_audio_plugins()),
+                'gfx': _first(plugins.get_video_plugins()),
+                'input': _first(plugins.get_input_plugins()),
+                'rsp': _first(plugins.get_rsp_plugins()),
+            },
+            'resolution': '1920x1080',
+            'rom': '',
+        }
+    }
+
+
+def ensure_config():
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    if not os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH, 'w') as f:
+            yaml.safe_dump(_default_settings(), f)
 
 
 class read_settings:
     def __init__(self):
-        default_settings = """
-settings:
-  fullscreen: false
-  plugins:
-    audio: /usr/lib64/mupen64plus/mupen64plus-audio-sdl.so
-    gfx: /usr/lib64/mupen64plus/mupen64plus-video-glide64mk2.so
-    input: /usr/lib64/mupen64plus/mupen64plus-input-sdl.so
-    rsp: /usr/lib64/mupen64plus/mupen64plus-rsp-hle.so
-  resolution: 1920x1080
-  rom: ''"""
-        default_dir = os.path.expanduser('~/.config/mupengtk')
-        default_path = default_dir + "/settings.yaml"
-        if not os.path.exists(default_dir):
-            os.makedirs(default_dir)
-            f = open(default_path, 'w')
-            f.write(default_settings)
-            f.close()
-        try:
-            with open(default_path) as settings:
-                settings = yaml.load(settings, Loader=yaml.FullLoader)
-                self.rom = settings["settings"]["rom"]
-                self.gfx = settings["settings"]["plugins"]["gfx"]
-                self.audio = settings["settings"]["plugins"]["audio"]
-                self.input = settings["settings"]["plugins"]["input"]
-                self.rsp = settings["settings"]["plugins"]["rsp"]
-                self.resolution = settings["settings"]["resolution"]
-                self.fullscreen = settings["settings"]["fullscreen"]
-        except FileNotFoundError:
-            f = open(default_path, 'w')
-            f.write(default_settings)
-            f.close()
-            with open(default_path) as settings:
-                settings = yaml.load(settings, Loader=yaml.FullLoader)
-                self.rom = settings["settings"]["rom"]
-                self.gfx = settings["settings"]["plugins"]["gfx"]
-                self.audio = settings["settings"]["plugins"]["audio"]
-                self.input = settings["settings"]["plugins"]["input"]
-                self.rsp = settings["settings"]["plugins"]["rsp"]
-                self.resolution = settings["settings"]["resolution"]
-                self.fullscreen = settings["settings"]["fullscreen"]
+        ensure_config()
+        with open(CONFIG_PATH) as f:
+            data = yaml.safe_load(f) or {}
+        settings = data.get('settings', {}) or {}
+        plugins = settings.get('plugins', {}) or {}
+        self.rom = settings.get('rom', '')
+        self.gfx = plugins.get('gfx', '')
+        self.audio = plugins.get('audio', '')
+        self.input = plugins.get('input', '')
+        self.rsp = plugins.get('rsp', '')
+        self.resolution = settings.get('resolution', '1920x1080')
+        self.fullscreen = bool(settings.get('fullscreen', False))
 
     def get_rom(self):
         return self.rom
@@ -65,3 +77,6 @@ settings:
 
     def get_fullscreen(self):
         return self.fullscreen
+
+
+Settings = read_settings
