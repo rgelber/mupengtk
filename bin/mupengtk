@@ -5,15 +5,24 @@ import configparser
 import fcntl
 import glob
 import os
+import re
 import shutil
 import struct
 import subprocess
 import sys
+import threading
+import urllib.error
+import urllib.parse
+import urllib.request
 
 import gi
 gi.require_version('Gtk', '3.0')
 gi.require_version('Gdk', '3.0')
-from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
+gi.require_version('GdkPixbuf', '2.0')
+gi.require_version('Pango', '1.0')
+from gi.repository import (  # noqa: E402
+    Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango,
+)
 
 import mupengtksettings  # noqa: E402
 
@@ -66,6 +75,33 @@ MUPEN64_CFG = os.path.join(
     'mupen64plus', 'mupen64plus.cfg',
 )
 CONTROL_SECTION = 'Input-SDL-Control1'
+
+# --- box-art (arcadeartwork.org N64 category 531) --------------------------
+CACHE_DIR = os.path.join(
+    os.environ.get('XDG_CACHE_HOME') or os.path.expanduser('~/.cache'),
+    'mupengtk',
+)
+BOXART_DIR = os.path.join(CACHE_DIR, 'boxart')
+BOXART_INDEX_PATH = os.path.join(CACHE_DIR, 'boxart_index.txt')
+BOXART_CATEGORY_URL = 'https://www.arcadeartwork.org/index.php?/category/531'
+BOXART_PAGE_URL = (
+    'https://www.arcadeartwork.org/index.php?/category/531/start-{start}'
+)
+BOXART_IMAGE_URL = (
+    'https://www.arcadeartwork.org/galleries/N64-box/{slug}.jpg'
+)
+BOXART_TIMEOUT = 20
+BOXART_PAGE_SIZE = 35
+BOXART_MAX_PAGES = 20
+BOXART_LARGE = (220, 300)
+BOXART_THUMB = (48, 66)
+BOXART_UA = 'mupengtk/0.1 (+arcade-box-art)'
+
+# Persisted ROM library folder (survives restarts).
+LIBRARY_CFG_PATH = os.path.join(
+    os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser('~/.config'),
+    'mupengtk', 'library.ini',
+)
 
 # Sensible defaults for a modern SDL-detected gamepad. Works for Xbox-style
 # pads, Switch Pro / DInput adapters, PS DualShock via DInput, etc. Users can
@@ -128,6 +164,14 @@ CSS = b"""
 }
 .binding-capturing {
     background: alpha(@warning_color, 0.25);
+}
+.boxart {
+    background: alpha(@theme_fg_color, 0.06);
+    border-radius: 4px;
+    padding: 2px;
+}
+.rom-list row:selected {
+    background: alpha(@theme_selected_bg_color, 0.85);
 }
 """
 
@@ -224,6 +268,194 @@ def _apply_auto_config(js_path):
     return name, len(GENERIC_GAMEPAD_BINDINGS)
 
 
+# ---------- persisted preferences (library.ini) ----------
+def _prefs_read():
+    cfg = configparser.ConfigParser(interpolation=None)
+    if os.path.exists(LIBRARY_CFG_PATH):
+        try:
+            cfg.read(LIBRARY_CFG_PATH)
+        except configparser.Error:
+            pass
+    if not cfg.has_section('Library'):
+        cfg.add_section('Library')
+    return cfg
+
+
+def _prefs_write(cfg):
+    os.makedirs(os.path.dirname(LIBRARY_CFG_PATH), exist_ok=True)
+    with open(LIBRARY_CFG_PATH, 'w') as f:
+        cfg.write(f)
+
+
+def _pref_get(key, default=None):
+    return _prefs_read()['Library'].get(key, default)
+
+
+def _pref_set(key, value):
+    cfg = _prefs_read()
+    cfg['Library'][key] = value
+    _prefs_write(cfg)
+
+
+def _pref_get_bool(key, default):
+    v = _pref_get(key)
+    if v is None:
+        return default
+    return v.lower() in ('1', 'true', 'yes', 'on')
+
+
+def _get_library_folder():
+    folder = _pref_get('folder') or None
+    return folder or None
+
+
+def _set_library_folder(path):
+    _pref_set('folder', path)
+
+
+def _list_roms(folder):
+    if not folder or not os.path.isdir(folder):
+        return []
+    try:
+        entries = sorted(os.listdir(folder))
+    except OSError:
+        return []
+    exts = tuple(p.lstrip('*') for p in ROM_PATTERNS)  # .n64 .z64 .v64
+    return [
+        os.path.join(folder, name)
+        for name in entries
+        if name.lower().endswith(exts)
+        and os.path.isfile(os.path.join(folder, name))
+    ]
+
+
+# ---------- box art ----------
+def _load_boxart_index():
+    if not os.path.exists(BOXART_INDEX_PATH):
+        return []
+    try:
+        with open(BOXART_INDEX_PATH) as f:
+            return [line.strip() for line in f if line.strip()]
+    except OSError:
+        return []
+
+
+def _save_boxart_index(slugs):
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(BOXART_INDEX_PATH, 'w') as f:
+            f.write('\n'.join(slugs))
+    except OSError:
+        pass
+
+
+_SLUG_RE = re.compile(r'galleries/N64-box/([^"\']+?)-th\.jpg')
+
+
+def _fetch_boxart_index():
+    """Scrape arcadeartwork.org N64 category to build a slug list."""
+    slugs = []
+    seen = set()
+    for i in range(BOXART_MAX_PAGES):
+        start = i * BOXART_PAGE_SIZE
+        url = BOXART_CATEGORY_URL if start == 0 else BOXART_PAGE_URL.format(start=start)
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': BOXART_UA})
+            with urllib.request.urlopen(req, timeout=BOXART_TIMEOUT) as r:
+                html = r.read().decode('utf-8', errors='replace')
+        except (urllib.error.URLError, TimeoutError, OSError):
+            break
+        new = 0
+        for slug in _SLUG_RE.findall(html):
+            if slug not in seen:
+                seen.add(slug)
+                slugs.append(slug)
+                new += 1
+        if new == 0:
+            break
+    return slugs
+
+
+def _normalize(s):
+    if not s:
+        return ''
+    s = re.sub(r'[\(\[][^)\]]*[)\]]', ' ', s)  # drop (USA)/[!]/etc.
+    s = re.sub(r'[^A-Za-z0-9]+', ' ', s).lower()
+    return ' '.join(s.split())
+
+
+def _match_slug(rom_name, slugs):
+    """Pick the best-matching slug for a ROM display name."""
+    target = _normalize(rom_name)
+    if not target or not slugs:
+        return None
+    t_tokens = target.split()
+    t_set = set(t_tokens)
+    best = None
+    best_score = 0.0
+    best_len = 0
+    for slug in slugs:
+        norm = _normalize(slug)
+        if not norm:
+            continue
+        if norm == target:
+            return slug
+        s_tokens = norm.split()
+        s_set = set(s_tokens)
+        common = t_set & s_set
+        if not common:
+            continue
+        score = 2 * len(common) / (len(t_set) + len(s_set))
+        # Prefer matches that cover more of the ROM name tokens.
+        if score > best_score or (score == best_score and len(norm) > best_len):
+            best = slug
+            best_score = score
+            best_len = len(norm)
+    return best if best_score >= 0.55 else None
+
+
+def _boxart_local_path(slug):
+    return os.path.join(BOXART_DIR, slug + '.jpg')
+
+
+def _download_boxart(slug):
+    """Download to cache. Return local path on success, None on failure."""
+    if not slug:
+        return None
+    dest = _boxart_local_path(slug)
+    if os.path.exists(dest) and os.path.getsize(dest) > 0:
+        return dest
+    url = BOXART_IMAGE_URL.format(slug=urllib.parse.quote(slug, safe=''))
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': BOXART_UA})
+        with urllib.request.urlopen(req, timeout=BOXART_TIMEOUT) as r:
+            data = r.read()
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return None
+    if not data:
+        return None
+    try:
+        os.makedirs(BOXART_DIR, exist_ok=True)
+        tmp = dest + '.part'
+        with open(tmp, 'wb') as f:
+            f.write(data)
+        os.replace(tmp, dest)
+    except OSError:
+        return None
+    return dest
+
+
+def _load_pixbuf(path, max_w, max_h):
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        return GdkPixbuf.Pixbuf.new_from_file_at_scale(
+            path, max_w, max_h, True,
+        )
+    except GLib.Error:
+        return None
+
+
 class JoystickReader:
     """Read raw events from /dev/input/jsX (Linux joystick API)."""
 
@@ -276,9 +508,29 @@ class Window(Gtk.ApplicationWindow):
         self._binding_button = None
         self.binding_rows = {}
 
+        # Box-art / library state.
+        self._library_folder = _get_library_folder()
+        self._boxart_index = _load_boxart_index()
+        self._boxart_token = 0
+        self._boxart_current = None
+        self._bulk_thread = None
+        self._rom_rows = {}  # rom_path -> ListBoxRow
+        self._search_query = ''
+
+        # Persisted UI/emulator prefs.
+        self._preserve_aspect = _pref_get_bool('preserve_aspect', True)
+        self._dark_mode = _pref_get_bool('dark_mode', False)
+        gtk_settings = Gtk.Settings.get_default()
+        self._original_theme = (
+            gtk_settings.get_property('gtk-theme-name')
+            if gtk_settings is not None else None
+        )
+        self._apply_dark_mode(self._dark_mode)
+
         self._install_css()
         self._build_header()
         self._build_body()
+        self._refresh_library()
         self._refresh_info_panel()
         self._refresh_binding_rows()
         self._update_running_state(running=False)
@@ -329,14 +581,13 @@ class Window(Gtk.ApplicationWindow):
         self.status_dot.set_margin_start(8)
         hb.pack_start(self.status_dot)
 
-        self.fullscreen_btn = Gtk.ToggleButton(label='Fullscreen')
+        self.fullscreen_btn = Gtk.MenuButton(label='Fullscreen')
         self.fullscreen_btn.set_image(Gtk.Image.new_from_icon_name(
             'view-fullscreen-symbolic', Gtk.IconSize.BUTTON,
         ))
         self.fullscreen_btn.set_always_show_image(True)
-        self.fullscreen_btn.set_tooltip_text('Fullscreen when starting emulation')
-        self.fullscreen_btn.set_active(self.settings.get_fullscreen())
-        self.fullscreen_btn.connect('toggled', self._on_toggle_fullscreen)
+        self.fullscreen_btn.set_tooltip_text('Fullscreen options')
+        self.fullscreen_btn.set_popover(self._build_fullscreen_popover())
         hb.pack_end(self.fullscreen_btn)
 
         self.controls_btn = Gtk.MenuButton(label='Controls')
@@ -358,6 +609,34 @@ class Window(Gtk.ApplicationWindow):
 
         self.set_titlebar(hb)
 
+    def _build_fullscreen_popover(self):
+        popover = Gtk.Popover()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_margin_top(10)
+        box.set_margin_bottom(10)
+        box.set_margin_start(12)
+        box.set_margin_end(12)
+
+        self._fs_check = Gtk.CheckButton.new_with_label('Launch in fullscreen')
+        self._fs_check.set_active(self.settings.get_fullscreen())
+        self._fs_check.connect('toggled', self._on_toggle_fullscreen)
+        box.pack_start(self._fs_check, False, False, 0)
+
+        self._aspect_check = Gtk.CheckButton.new_with_label(
+            'Keep native 4:3 aspect ratio'
+        )
+        self._aspect_check.set_tooltip_text(
+            'Letterbox to the N64 4:3 aspect. Turn off to stretch to the '
+            'whole screen.'
+        )
+        self._aspect_check.set_active(self._preserve_aspect)
+        self._aspect_check.connect('toggled', self._on_toggle_aspect)
+        box.pack_start(self._aspect_check, False, False, 0)
+
+        popover.add(box)
+        box.show_all()
+        return popover
+
     def _build_menu(self):
         menu = Gtk.Menu()
         menu.append(self._build_plugins_item())
@@ -377,6 +656,11 @@ class Window(Gtk.ApplicationWindow):
         clear_log = Gtk.MenuItem.new_with_label('Clear Log')
         clear_log.connect('activate', self._on_clear_log)
         menu.append(clear_log)
+        menu.append(Gtk.SeparatorMenuItem())
+        dark = Gtk.CheckMenuItem.new_with_label('Dark mode')
+        dark.set_active(self._dark_mode)
+        dark.connect('toggled', self._on_toggle_dark_mode)
+        menu.append(dark)
         menu.show_all()
         return menu
 
@@ -465,32 +749,71 @@ class Window(Gtk.ApplicationWindow):
         header.get_style_context().add_class('dim-label')
         box.pack_start(header, False, False, 0)
 
-        self.chooser = Gtk.FileChooserWidget.new(Gtk.FileChooserAction.OPEN)
-        self.chooser.set_local_only(True)
-        self.chooser.set_hexpand(True)
-        self.chooser.set_vexpand(True)
+        folder_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.folder_label = Gtk.Label(xalign=0)
+        self.folder_label.get_style_context().add_class('dim-label')
+        self.folder_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        self.folder_label.set_hexpand(True)
+        folder_row.pack_start(self.folder_label, True, True, 0)
 
-        rom_filter = Gtk.FileFilter()
-        rom_filter.set_name('N64 ROMs (.n64 .z64 .v64)')
-        for p in ROM_PATTERNS:
-            rom_filter.add_pattern(p)
-        self.chooser.add_filter(rom_filter)
-        any_filter = Gtk.FileFilter()
-        any_filter.set_name('All files')
-        any_filter.add_pattern('*')
-        self.chooser.add_filter(any_filter)
+        browse_btn = Gtk.Button.new_with_label('Choose folder…')
+        browse_btn.set_image(Gtk.Image.new_from_icon_name(
+            'folder-open-symbolic', Gtk.IconSize.BUTTON,
+        ))
+        browse_btn.set_always_show_image(True)
+        browse_btn.set_tooltip_text('Select the folder containing your N64 ROMs')
+        browse_btn.connect('clicked', self._on_browse_folder)
+        folder_row.pack_end(browse_btn, False, False, 0)
+        box.pack_start(folder_row, False, False, 0)
 
-        current = self.settings.get_rom()
-        if current and os.path.isfile(current):
-            self.chooser.set_filename(current)
-        elif current and os.path.isdir(os.path.dirname(current)):
-            self.chooser.set_current_folder(os.path.dirname(current))
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.download_art_btn = Gtk.Button.new_with_label('Download box art')
+        self.download_art_btn.set_image(Gtk.Image.new_from_icon_name(
+            'image-x-generic-symbolic', Gtk.IconSize.BUTTON,
+        ))
+        self.download_art_btn.set_always_show_image(True)
+        self.download_art_btn.set_tooltip_text(
+            'Fetch box art from arcadeartwork.org for every ROM in this folder'
+        )
+        self.download_art_btn.connect('clicked', self._on_download_all_art)
+        actions.pack_start(self.download_art_btn, False, False, 0)
+        self.art_progress = Gtk.Label(xalign=0)
+        self.art_progress.get_style_context().add_class('dim-label')
+        self.art_progress.set_ellipsize(Pango.EllipsizeMode.END)
+        actions.pack_start(self.art_progress, True, True, 0)
+        box.pack_start(actions, False, False, 0)
 
-        self.chooser.connect('selection-changed', self._on_rom_selected)
-        self.chooser.connect('file-activated', self._on_rom_activated)
-        box.pack_start(self.chooser, True, True, 0)
+        self.rom_search = Gtk.SearchEntry()
+        self.rom_search.set_placeholder_text('Search ROMs…')
+        self.rom_search.connect('search-changed', self._on_search_changed)
+        box.pack_start(self.rom_search, False, False, 0)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_hexpand(True)
+        scroll.set_vexpand(True)
+        self.rom_list = Gtk.ListBox()
+        self.rom_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.rom_list.get_style_context().add_class('rom-list')
+        self.rom_list.set_filter_func(self._rom_row_filter, None)
+        self.rom_list.connect('row-selected', self._on_rom_row_selected)
+        self.rom_list.connect('row-activated', self._on_rom_row_activated)
+        scroll.add(self.rom_list)
+        box.pack_start(scroll, True, True, 0)
 
         return box
+
+    def _on_search_changed(self, entry):
+        self._search_query = _normalize(entry.get_text())
+        self.rom_list.invalidate_filter()
+
+    def _rom_row_filter(self, row, _data):
+        if not self._search_query:
+            return True
+        path = getattr(row, 'rom_path', None)
+        if not path:
+            return False
+        return self._search_query in _normalize(_rom_display_name(path))
 
     def _build_right_pane(self):
         notebook = Gtk.Notebook()
@@ -503,6 +826,8 @@ class Window(Gtk.ApplicationWindow):
         return notebook
 
     def _build_info_tab(self):
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         outer.set_margin_top(16)
         outer.set_margin_bottom(16)
@@ -514,29 +839,36 @@ class Window(Gtk.ApplicationWindow):
         section.get_style_context().add_class('dim-label')
         outer.pack_start(section, False, False, 0)
 
+        header_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        self.boxart_image = Gtk.Image()
+        self.boxart_image.get_style_context().add_class('boxart')
+        self.boxart_image.set_size_request(*BOXART_LARGE)
+        self.boxart_image.set_valign(Gtk.Align.START)
+        header_row.pack_start(self.boxart_image, False, False, 0)
+
+        right_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        right_col.set_valign(Gtk.Align.START)
         self.rom_title = Gtk.Label(xalign=0)
         self.rom_title.get_style_context().add_class('rom-title')
         self.rom_title.set_line_wrap(True)
-        outer.pack_start(self.rom_title, False, False, 0)
+        right_col.pack_start(self.rom_title, False, False, 0)
 
         self.rom_path = Gtk.Label(xalign=0)
         self.rom_path.get_style_context().add_class('dim-label')
         self.rom_path.set_line_wrap(True)
         self.rom_path.set_selectable(True)
-        outer.pack_start(self.rom_path, False, False, 0)
+        self.rom_path.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        right_col.pack_start(self.rom_path, False, False, 0)
 
-        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        card.get_style_context().add_class('card')
-
-        card_title = Gtk.Label(label='CONFIGURATION', xalign=0)
-        card_title.get_style_context().add_class('section-label')
-        card_title.get_style_context().add_class('dim-label')
-        card.pack_start(card_title, False, False, 0)
+        cfg_header = Gtk.Label(label='CONFIGURATION', xalign=0)
+        cfg_header.get_style_context().add_class('section-label')
+        cfg_header.get_style_context().add_class('dim-label')
+        cfg_header.set_margin_top(8)
+        right_col.pack_start(cfg_header, False, False, 0)
 
         grid = Gtk.Grid()
         grid.set_column_spacing(14)
-        grid.set_row_spacing(6)
-        grid.set_margin_top(4)
+        grid.set_row_spacing(4)
         self.info_labels = {}
         rows = (
             ('Resolution', 'resolution'),
@@ -553,10 +885,14 @@ class Window(Gtk.ApplicationWindow):
             v = Gtk.Label(xalign=0)
             v.set_line_wrap(True)
             v.set_selectable(True)
+            v.set_ellipsize(Pango.EllipsizeMode.END)
+            v.set_hexpand(True)
             grid.attach(v, 1, i, 1, 1)
             self.info_labels[key] = v
-        card.pack_start(grid, False, False, 0)
-        outer.pack_start(card, False, False, 0)
+        right_col.pack_start(grid, False, False, 0)
+
+        header_row.pack_start(right_col, True, True, 0)
+        outer.pack_start(header_row, False, False, 0)
 
         self.big_play = Gtk.Button.new_with_label('Play')
         self.big_play.get_style_context().add_class('suggested-action')
@@ -565,7 +901,8 @@ class Window(Gtk.ApplicationWindow):
         self.big_play.connect('clicked', self.on_start)
         outer.pack_start(self.big_play, False, False, 0)
 
-        return outer
+        scroller.add(outer)
+        return scroller
 
     def _build_log_tab(self):
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -692,6 +1029,7 @@ class Window(Gtk.ApplicationWindow):
             self.rom_title.get_style_context().add_class('rom-none')
             self.rom_path.set_text('Choose a ROM from the library to get started')
             self.big_play.set_sensitive(False)
+        self._update_boxart(rom)
 
         def basename_or_none(p):
             return os.path.basename(p) if p else '—'
@@ -788,11 +1126,13 @@ class Window(Gtk.ApplicationWindow):
         elif name == 'pause':
             self._on_pause_clicked(None)
         elif name == 'fullscreen':
-            self.fullscreen_btn.set_active(not self.fullscreen_btn.get_active())
+            self._fs_check.set_active(not self._fs_check.get_active())
 
     # ---------- handlers ----------
-    def _on_rom_selected(self, chooser):
-        path = chooser.get_filename()
+    def _on_rom_row_selected(self, _listbox, row):
+        if row is None:
+            return
+        path = getattr(row, 'rom_path', None)
         if not path or not os.path.isfile(path):
             return
         if path == self.settings.get_rom():
@@ -801,8 +1141,235 @@ class Window(Gtk.ApplicationWindow):
         self._reload_settings()
         self.statusbar.push(self.status_ctx, f'Selected: {os.path.basename(path)}')
 
-    def _on_rom_activated(self, _chooser):
+    def _on_rom_row_activated(self, _listbox, _row):
         self.on_start(None)
+
+    def _on_browse_folder(self, _btn):
+        dialog = Gtk.FileChooserDialog(
+            title='Select ROM folder',
+            parent=self,
+            action=Gtk.FileChooserAction.SELECT_FOLDER,
+        )
+        dialog.add_buttons(
+            'Cancel', Gtk.ResponseType.CANCEL,
+            'Select', Gtk.ResponseType.ACCEPT,
+        )
+        dialog.set_local_only(True)
+        if self._library_folder and os.path.isdir(self._library_folder):
+            dialog.set_current_folder(self._library_folder)
+        elif self.settings.get_rom():
+            parent = os.path.dirname(self.settings.get_rom())
+            if parent and os.path.isdir(parent):
+                dialog.set_current_folder(parent)
+        response = dialog.run()
+        folder = dialog.get_filename() if response == Gtk.ResponseType.ACCEPT else None
+        dialog.destroy()
+        if not folder:
+            return
+        try:
+            _set_library_folder(folder)
+        except OSError as e:
+            self.statusbar.push(self.status_ctx, f'Failed to save folder: {e}')
+            return
+        self._library_folder = folder
+        self._refresh_library()
+
+    def _on_download_all_art(self, _btn):
+        folder = self._library_folder
+        if not folder:
+            self.statusbar.push(self.status_ctx, 'Select a ROM folder first')
+            return
+        if self._bulk_thread and self._bulk_thread.is_alive():
+            self.statusbar.push(self.status_ctx, 'Box-art download already running')
+            return
+        roms = _list_roms(folder)
+        if not roms:
+            self.statusbar.push(self.status_ctx, 'No ROMs in this folder')
+            return
+        self.download_art_btn.set_sensitive(False)
+        self.art_progress.set_text('Preparing…')
+        self._bulk_thread = threading.Thread(
+            target=self._bulk_art_worker,
+            args=(roms,),
+            daemon=True,
+        )
+        self._bulk_thread.start()
+
+    # ---------- library ----------
+    def _refresh_library(self):
+        for child in self.rom_list.get_children():
+            self.rom_list.remove(child)
+        self._rom_rows = {}
+        folder = self._library_folder
+        if not folder or not os.path.isdir(folder):
+            self.folder_label.set_text('No folder selected')
+            self.download_art_btn.set_sensitive(False)
+            return
+        self.folder_label.set_text(folder)
+        self.folder_label.set_tooltip_text(folder)
+        roms = _list_roms(folder)
+        self.download_art_btn.set_sensitive(bool(roms))
+        current = self.settings.get_rom()
+        current_row = None
+        for path in roms:
+            row = self._make_rom_row(path)
+            self.rom_list.add(row)
+            self._rom_rows[path] = row
+            if path == current:
+                current_row = row
+        self.rom_list.show_all()
+        if current_row is not None:
+            self.rom_list.select_row(current_row)
+        if not roms:
+            empty = Gtk.ListBoxRow()
+            empty.set_selectable(False)
+            empty.set_activatable(False)
+            lbl = Gtk.Label(
+                label='No .n64/.z64/.v64 files in this folder.',
+                xalign=0,
+            )
+            lbl.get_style_context().add_class('dim-label')
+            lbl.set_margin_top(12)
+            lbl.set_margin_bottom(12)
+            lbl.set_margin_start(8)
+            empty.add(lbl)
+            self.rom_list.add(empty)
+            self.rom_list.show_all()
+
+    def _make_rom_row(self, path):
+        row = Gtk.ListBoxRow()
+        row.rom_path = path
+        hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        hbox.set_margin_top(6)
+        hbox.set_margin_bottom(6)
+        hbox.set_margin_start(8)
+        hbox.set_margin_end(8)
+        thumb = Gtk.Image()
+        thumb.set_size_request(*BOXART_THUMB)
+        row.thumb = thumb
+        self._apply_thumb(row, path)
+        hbox.pack_start(thumb, False, False, 0)
+        label = Gtk.Label(label=_rom_display_name(path), xalign=0)
+        label.set_line_wrap(True)
+        label.set_ellipsize(Pango.EllipsizeMode.END)
+        hbox.pack_start(label, True, True, 0)
+        row.add(hbox)
+        return row
+
+    def _apply_thumb(self, row, path):
+        pb = self._cached_pixbuf_for(path, BOXART_THUMB)
+        if pb is not None:
+            row.thumb.set_from_pixbuf(pb)
+        else:
+            row.thumb.set_from_icon_name('applications-games-symbolic', Gtk.IconSize.DND)
+
+    def _cached_pixbuf_for(self, rom_path, size):
+        slug = _match_slug(_rom_display_name(rom_path), self._boxart_index)
+        if not slug:
+            return None
+        local = _boxart_local_path(slug)
+        if not os.path.exists(local):
+            return None
+        return _load_pixbuf(local, size[0], size[1])
+
+    # ---------- box art (info panel) ----------
+    def _update_boxart(self, rom_path):
+        self._boxart_token += 1
+        token = self._boxart_token
+        self._boxart_current = rom_path
+        if not rom_path:
+            self._set_boxart_placeholder()
+            return
+        pb = self._cached_pixbuf_for(rom_path, BOXART_LARGE)
+        if pb is not None:
+            self.boxart_image.set_from_pixbuf(pb)
+            return
+        self._set_boxart_placeholder()
+        threading.Thread(
+            target=self._boxart_worker,
+            args=(rom_path, token),
+            daemon=True,
+        ).start()
+
+    def _set_boxart_placeholder(self):
+        self.boxart_image.set_from_icon_name(
+            'applications-games-symbolic', Gtk.IconSize.DIALOG,
+        )
+        self.boxart_image.set_pixel_size(96)
+
+    def _boxart_worker(self, rom_path, token):
+        # If we don't have an index yet, try to build one.
+        if not self._boxart_index:
+            slugs = _fetch_boxart_index()
+            if slugs:
+                self._boxart_index = slugs
+                _save_boxart_index(slugs)
+        slug = _match_slug(_rom_display_name(rom_path), self._boxart_index)
+        local = _download_boxart(slug) if slug else None
+        GLib.idle_add(self._on_boxart_ready, rom_path, token, local)
+
+    def _on_boxart_ready(self, rom_path, token, local):
+        if token != self._boxart_token:
+            return False
+        if local and os.path.exists(local):
+            pb = _load_pixbuf(local, BOXART_LARGE[0], BOXART_LARGE[1])
+            if pb is not None:
+                self.boxart_image.set_from_pixbuf(pb)
+        # Refresh the matching list-row thumbnail too.
+        row = self._rom_rows.get(rom_path)
+        if row is not None:
+            self._apply_thumb(row, rom_path)
+        return False
+
+    # ---------- bulk box-art download ----------
+    def _bulk_art_worker(self, roms):
+        if not self._boxart_index:
+            GLib.idle_add(self._bulk_progress, 'Fetching index from arcadeartwork.org…')
+            slugs = _fetch_boxart_index()
+            if slugs:
+                self._boxart_index = slugs
+                _save_boxart_index(slugs)
+        if not self._boxart_index:
+            GLib.idle_add(self._bulk_done, 0, 0, 'Failed to fetch box-art index')
+            return
+        total = len(roms)
+        hits = 0
+        for i, path in enumerate(roms, 1):
+            name = _rom_display_name(path)
+            GLib.idle_add(self._bulk_progress, f'[{i}/{total}] {name}')
+            slug = _match_slug(name, self._boxart_index)
+            if not slug:
+                continue
+            local = _download_boxart(slug)
+            if local:
+                hits += 1
+                GLib.idle_add(self._bulk_row_thumb, path)
+        GLib.idle_add(self._bulk_done, hits, total, None)
+
+    def _bulk_progress(self, text):
+        self.art_progress.set_text(text)
+        return False
+
+    def _bulk_row_thumb(self, rom_path):
+        row = self._rom_rows.get(rom_path)
+        if row is not None:
+            self._apply_thumb(row, rom_path)
+        if rom_path == self._boxart_current:
+            pb = self._cached_pixbuf_for(rom_path, BOXART_LARGE)
+            if pb is not None:
+                self.boxart_image.set_from_pixbuf(pb)
+        return False
+
+    def _bulk_done(self, hits, total, error):
+        self.download_art_btn.set_sensitive(True)
+        if error:
+            self.art_progress.set_text(error)
+            self.statusbar.push(self.status_ctx, error)
+        else:
+            msg = f'Box art: {hits}/{total} matched'
+            self.art_progress.set_text(msg)
+            self.statusbar.push(self.status_ctx, msg)
+        return False
 
     def _on_option_toggled(self, widget, kind):
         if not widget.get_active():
@@ -821,6 +1388,31 @@ class Window(Gtk.ApplicationWindow):
     def _on_toggle_fullscreen(self, widget):
         self.setter.set_fullscreen(widget.get_active())
         self._reload_settings()
+
+    def _on_toggle_aspect(self, widget):
+        self._preserve_aspect = widget.get_active()
+        _pref_set('preserve_aspect', 'true' if self._preserve_aspect else 'false')
+        state = 'preserved (4:3)' if self._preserve_aspect else 'stretched to screen'
+        self.statusbar.push(self.status_ctx, f'Aspect ratio: {state}')
+
+    def _on_toggle_dark_mode(self, widget):
+        self._dark_mode = widget.get_active()
+        _pref_set('dark_mode', 'true' if self._dark_mode else 'false')
+        self._apply_dark_mode(self._dark_mode)
+
+    def _apply_dark_mode(self, dark):
+        s = Gtk.Settings.get_default()
+        if s is None:
+            return
+        if dark:
+            # Explicit theme swap is more reliable than the prefer-dark hint,
+            # which many themes ignore. Adwaita-dark is shipped with GTK.
+            s.set_property('gtk-theme-name', 'Adwaita-dark')
+            s.set_property('gtk-application-prefer-dark-theme', True)
+        else:
+            s.set_property('gtk-application-prefer-dark-theme', False)
+            if self._original_theme:
+                s.set_property('gtk-theme-name', self._original_theme)
 
     def _on_slot_activate(self, widget, key):
         if widget.get_active():
@@ -936,6 +1528,14 @@ class Window(Gtk.ApplicationWindow):
             self.statusbar.push(self.status_ctx, 'mupen64plus is not installed')
             return
         cmd = ['mupen64plus']
+        if self._preserve_aspect:
+            # Force each common gfx plugin to letterbox to 4:3. Unused
+            # sections are silently ignored by mupen64plus.
+            cmd += [
+                '--set', 'Video-GLideN64[AspectRatio]=1',
+                '--set', 'Video-Glide64mk2[aspect]=0',
+                '--set', 'Video-Rice[AspectRatio]=1',
+            ]
         for flag, value in (
             ('--gfx', settings.get_plugin_gfx()),
             ('--audio', settings.get_plugin_audio()),
