@@ -67,6 +67,32 @@ MUPEN64_CFG = os.path.join(
 )
 CONTROL_SECTION = 'Input-SDL-Control1'
 
+# Sensible defaults for a modern SDL-detected gamepad. Works for Xbox-style
+# pads, Switch Pro / DInput adapters, PS DualShock via DInput, etc. Users can
+# override individual bindings from the Controls popover.
+GENERIC_GAMEPAD_BINDINGS = {
+    'A Button':         'button(1)',
+    'B Button':         'button(2)',
+    'Z Trig':           'button(6)',
+    'Start':            'button(9)',
+    'L Trig':           'button(4)',
+    'R Trig':           'button(5)',
+    'DPad U':           'hat(0 Up)',
+    'DPad D':           'hat(0 Down)',
+    'DPad L':           'hat(0 Left)',
+    'DPad R':           'hat(0 Right)',
+    'C Button U':       'axis(3-)',
+    'C Button D':       'axis(3+)',
+    'C Button L':       'axis(2-)',
+    'C Button R':       'axis(2+)',
+    'Mempak switch':    '',
+    'Rumblepak switch': '',
+    'X Axis':           'axis(0-,0+)',
+    'Y Axis':           'axis(1-,1+)',
+}
+# N64 buttons where the binding should target a full analog axis pair.
+_AXIS_PAIR_BUTTONS = {'X Axis', 'Y Axis'}
+
 JS_EVENT_BUTTON = 0x01
 JS_EVENT_AXIS = 0x02
 JS_EVENT_INIT = 0x80
@@ -124,6 +150,20 @@ def _first_joystick():
     return devs[0] if devs else None
 
 
+def _joystick_name(path):
+    dev = os.path.basename(path)
+    try:
+        with open(f'/sys/class/input/{dev}/device/name') as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def _joystick_index(path):
+    digits = ''.join(c for c in os.path.basename(path) if c.isdigit())
+    return int(digits) if digits else 0
+
+
 def _load_bindings():
     cfg = configparser.ConfigParser(interpolation=None)
     cfg.optionxform = str
@@ -137,8 +177,7 @@ def _load_bindings():
     return {k: v.strip('"') for k, v in cfg[CONTROL_SECTION].items()}
 
 
-def _save_binding(button_key, value):
-    os.makedirs(os.path.dirname(MUPEN64_CFG), exist_ok=True)
+def _open_cfg():
     cfg = configparser.ConfigParser(interpolation=None)
     cfg.optionxform = str
     if os.path.exists(MUPEN64_CFG):
@@ -151,9 +190,38 @@ def _save_binding(button_key, value):
         cfg[CONTROL_SECTION]['plugged'] = 'True'
         cfg[CONTROL_SECTION]['plugin'] = '2'
         cfg[CONTROL_SECTION]['device'] = '0'
-    cfg[CONTROL_SECTION][button_key] = f'"{value}"'
+    return cfg
+
+
+def _write_cfg(cfg):
+    os.makedirs(os.path.dirname(MUPEN64_CFG), exist_ok=True)
     with open(MUPEN64_CFG, 'w') as f:
         cfg.write(f)
+
+
+def _save_binding(button_key, value):
+    cfg = _open_cfg()
+    cfg[CONTROL_SECTION][button_key] = f'"{value}"'
+    _write_cfg(cfg)
+
+
+def _apply_auto_config(js_path):
+    """Point mupen64plus at the detected joystick and apply generic gamepad
+    bindings. Returns (name, applied_count) or (None, 0) if no joystick."""
+    if not js_path:
+        return None, 0
+    cfg = _open_cfg()
+    cfg[CONTROL_SECTION]['plugged'] = 'True'
+    cfg[CONTROL_SECTION]['plugin'] = '2'
+    cfg[CONTROL_SECTION]['mode'] = '0'  # 0 = fully manual, apply our bindings
+    cfg[CONTROL_SECTION]['device'] = str(_joystick_index(js_path))
+    name = _joystick_name(js_path)
+    if name:
+        cfg[CONTROL_SECTION]['name'] = f'"{name}"'
+    for key, value in GENERIC_GAMEPAD_BINDINGS.items():
+        cfg[CONTROL_SECTION][key] = f'"{value}"'
+    _write_cfg(cfg)
+    return name, len(GENERIC_GAMEPAD_BINDINGS)
 
 
 class JoystickReader:
@@ -167,21 +235,20 @@ class JoystickReader:
         flags = fcntl.fcntl(self.fd, fcntl.F_GETFL)
         fcntl.fcntl(self.fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 
-    def read_event(self):
-        try:
-            data = os.read(self.fd, self.STRUCT.size)
-        except BlockingIOError:
-            return None
-        if len(data) < self.STRUCT.size:
-            return None
-        _t, value, type_, number = self.STRUCT.unpack(data)
-        if type_ & JS_EVENT_INIT:
-            return None
-        return (type_ & 0x7F, number, value)
-
-    def drain(self):
-        while self.read_event() is not None:
-            pass
+    def poll_event(self):
+        """Return next real event as (type, number, value), or None if only
+        synthetic init events (or no data) are pending."""
+        while True:
+            try:
+                data = os.read(self.fd, self.STRUCT.size)
+            except BlockingIOError:
+                return None
+            if len(data) < self.STRUCT.size:
+                return None
+            _t, value, type_, number = self.STRUCT.unpack(data)
+            if type_ & JS_EVENT_INIT:
+                continue
+            return (type_ & 0x7F, number, value)
 
     def close(self):
         try:
@@ -552,6 +619,16 @@ class Window(Gtk.ApplicationWindow):
         self.controls_status.set_line_wrap(True)
         outer.pack_start(self.controls_status, False, False, 0)
 
+        auto_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        auto_btn = Gtk.Button.new_with_label('Auto-configure')
+        auto_btn.set_tooltip_text(
+            'Point mupen64plus at the detected controller and apply a generic '
+            'gamepad layout. You can override individual bindings below.'
+        )
+        auto_btn.connect('clicked', self._on_auto_configure)
+        auto_row.pack_start(auto_btn, False, False, 0)
+        outer.pack_start(auto_row, False, False, 0)
+
         scroll = Gtk.ScrolledWindow()
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scroll.set_hexpand(True)
@@ -635,13 +712,17 @@ class Window(Gtk.ApplicationWindow):
     def _refresh_binding_rows(self):
         bindings = _load_bindings()
         for key, (label, _btn) in self.binding_rows.items():
-            label.set_text(bindings.get(key, '(unbound)'))
+            label.set_text(bindings.get(key) or '(unbound)')
         js = _first_joystick()
         if js:
-            self.controls_status.set_text(f'Gamepad detected at {js}. Click Bind, then press a button or move a stick.')
+            name = _joystick_name(js) or 'unknown model'
+            self.controls_status.set_text(
+                f'Detected: {name} ({js}). '
+                'Auto-configure applies generic gamepad defaults; use Bind to override.'
+            )
         else:
             self.controls_status.set_text(
-                'No gamepad detected under /dev/input/js*. Connect one and reopen this tab.'
+                'No gamepad detected under /dev/input/js*. Plug one in and reopen this popover.'
             )
 
     def _update_running_state(self, running):
@@ -766,16 +847,13 @@ class Window(Gtk.ApplicationWindow):
         except OSError as e:
             self.statusbar.push(self.status_ctx, f'Could not open {js}: {e}')
             return
-        # Discard synthetic init events and any queued ones
-        for _ in range(200):
-            if self._binding_reader.read_event() is None:
-                break
         self._binding_target = key
         self._binding_button = button
         button.set_label('Press…')
         button.get_style_context().add_class('binding-capturing')
         self._binding_source = GLib.timeout_add(30, self._poll_binding)
-        self.statusbar.push(self.status_ctx, f'Press a button/stick for {key}…')
+        hint = 'move the stick' if key in _AXIS_PAIR_BUTTONS else 'press a button or move a stick'
+        self.statusbar.push(self.status_ctx, f'{key}: {hint}…')
 
     def _cancel_binding(self):
         if self._binding_source is not None:
@@ -793,19 +871,23 @@ class Window(Gtk.ApplicationWindow):
     def _poll_binding(self):
         if self._binding_reader is None:
             return False
-        ev = self._binding_reader.read_event()
+        ev = self._binding_reader.poll_event()
         if ev is None:
             return True
         type_, number, value = ev
+        target = self._binding_target
         binding = None
-        if type_ == JS_EVENT_BUTTON and value == 1:
-            binding = f'button({number})'
-        elif type_ == JS_EVENT_AXIS and abs(value) > 20000:
-            sign = '+' if value > 0 else '-'
-            binding = f'axis({number}{sign})'
+        if target in _AXIS_PAIR_BUTTONS:
+            if type_ == JS_EVENT_AXIS and abs(value) > 20000:
+                binding = f'axis({number}-,{number}+)'
+        else:
+            if type_ == JS_EVENT_BUTTON and value == 1:
+                binding = f'button({number})'
+            elif type_ == JS_EVENT_AXIS and abs(value) > 20000:
+                sign = '+' if value > 0 else '-'
+                binding = f'axis({number}{sign})'
         if binding is None:
             return True
-        target = self._binding_target
         try:
             _save_binding(target, binding)
         except OSError as e:
@@ -815,6 +897,23 @@ class Window(Gtk.ApplicationWindow):
         self._cancel_binding()
         self._refresh_binding_rows()
         return False
+
+    def _on_auto_configure(self, _btn):
+        js = _first_joystick()
+        if not js:
+            self.statusbar.push(self.status_ctx, 'No gamepad detected')
+            return
+        try:
+            name, count = _apply_auto_config(js)
+        except OSError as e:
+            self.statusbar.push(self.status_ctx, f'Failed to write config: {e}')
+            return
+        label = name or js
+        self.statusbar.push(
+            self.status_ctx,
+            f'Auto-configured {count} bindings for {label}. Restart the emulator to apply.',
+        )
+        self._refresh_binding_rows()
 
     def _on_clear_binding(self, _btn, key):
         try:
