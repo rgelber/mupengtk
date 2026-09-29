@@ -1,23 +1,24 @@
-Metadata-Version: 2.1
+Metadata-Version: 2.4
 Name: mupengtksettings
-Version: 0.1.0
-Summary: Settings file require for MupenGTK
-Home-page: https://git.sierratek.net/rcgelber/mupengtk
+Version: 0.2.0
+Summary: Settings library for MupenGTK
+Home-page: https://github.com/rcgelber/mupengtk
 Author: Ryan Gelber
 Author-email: ryangelber@gmail.com
-License: GLPv3
-Platform: UNKNOWN
-Classifier: Programming Language :: Python :: 3 :: Only
-Classifier: Programming Language :: Python :: 3.5
-Classifier: Programming Language :: Python :: 3.6
-Classifier: Programming Language :: Python :: 3.7
-Classifier: Programming Language :: Python :: 3.8
-Classifier: Programming Language :: Python :: 3.9
-Classifier: Programming Language :: Python :: Implementation :: CPython
-Classifier: Topic :: Software Development :: Libraries :: Python Modules
-Classifier: Topic :: Text Processing :: Markup
-Classifier: Typing :: Typed
+License: GPLv3
+Classifier: License :: OSI Approved :: GNU General Public License v3 (GPLv3)
+Classifier: Operating System :: POSIX :: Linux
+Classifier: Programming Language :: Python :: 3
+Classifier: Topic :: System :: Emulators
+Requires-Python: >=3.6
 License-File: LICENSE
-
-UNKNOWN
-
+Requires-Dist: PyYAML>=5.1
+Dynamic: author
+Dynamic: author-email
+Dynamic: classifier
+Dynamic: home-page
+Dynamic: license
+Dynamic: license-file
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary

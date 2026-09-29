@@ -7,4 +7,5 @@ mupengtksettings/set_settings.py
 mupengtksettings.egg-info/PKG-INFO
 mupengtksettings.egg-info/SOURCES.txt
 mupengtksettings.egg-info/dependency_links.txt
+mupengtksettings.egg-info/requires.txt
 mupengtksettings.egg-info/top_level.txt
